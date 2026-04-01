@@ -1,1 +1,0 @@
-# sni-bug-finder
