@@ -85,6 +85,32 @@ METHOD_LABELS = {
     "host_header_inject": "HostInject",
 }
 
+# ── SNI Mismatch Candidates ──────────────────────────────────────
+# Zero-rated / free-access hostnames — auto mismatch test
+SNI_CANDIDATES = [
+    # Facebook free/zero
+    "free.facebook.com", "zero.facebook.com",
+    "m.facebook.com",    "web.facebook.com",
+    # WhatsApp
+    "media.whatsapp.com", "static.whatsapp.net",
+    "mmg.whatsapp.net",
+    # Google
+    "www.google.com", "googleapis.com", "gstatic.com",
+    # Opera Mini
+    "wap.opera.mini.net", "compress.opera-mini.net",
+    # Wikipedia zero
+    "en.m.wikipedia.org", "www.wikipedia.org",
+    # Twitter / X
+    "twitter.com", "mobile.twitter.com",
+    # Speedtest / neutral
+    "www.speedtest.net", "fast.com",
+    # CDN
+    "cloudflare.com", "cdn.cloudflare.com",
+    # Social
+    "www.youtube.com", "www.instagram.com",
+    "t.me", "telegram.org",
+]
+
 # ================================================================
 #  UI Helpers
 # ================================================================
@@ -350,6 +376,36 @@ def check_http2(hostname, timeout):
 # ================================================================
 #  All SNI Methods in one call
 # ================================================================
+#  SNI Mismatch Auto-Detector
+# ================================================================
+def auto_detect_sni_mismatch(hostname, port, timeout):
+    """
+    SNI_CANDIDATES list එකේ ඔක්කොම try කරලා
+    respond කරන ඒවා list කරනවා.
+    Returns: [ {sni, tls, cn, latency}, ... ]
+    """
+    working = []
+    for candidate in SNI_CANDIDATES:
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            t0 = time.time()
+            with socket.create_connection((hostname, port), timeout=timeout) as s:
+                with ctx.wrap_socket(s, server_hostname=candidate) as ss:
+                    lat  = int((time.time() - t0) * 1000)
+                    cert = ss.getpeercert(binary_form=False) or {}
+                    subj = dict(x[0] for x in cert.get('subject', [])) if cert else {}
+                    working.append({
+                        "sni":     candidate,
+                        "tls":     ss.version(),
+                        "cn":      subj.get('commonName', '?'),
+                        "latency": lat,
+                    })
+        except: pass
+    return working
+
+# ================================================================
 def detect_all_methods(hostname, open_ports, timeout, bug_sni):
     methods = {}
     has_443 = 443 in open_ports
@@ -359,9 +415,31 @@ def detect_all_methods(hostname, open_ports, timeout, bug_sni):
     methods["direct_sni"] = method_direct_sni(hostname, 443, timeout) \
         if has_443 else {"works": False}
 
-    # 2. SNI Mismatch  ← Bug hosting core method
-    methods["sni_mismatch"] = method_sni_mismatch(hostname, bug_sni, 443, timeout) \
-        if has_443 else {"works": False}
+    # 2. SNI Mismatch ← Bug hosting core method
+    #    bug_sni="auto" නම් candidates ඔක්කොම try කරනවා
+    if has_443:
+        if bug_sni == "auto":
+            found = auto_detect_sni_mismatch(hostname, 443, timeout)
+            if found:
+                # best (lowest latency) candidate pick කරනවා
+                best = min(found, key=lambda x: x["latency"])
+                methods["sni_mismatch"] = {
+                    "works":      True,
+                    "tls":        best["tls"],
+                    "cn":         best["cn"],
+                    "latency":    best["latency"],
+                    "sni_used":   best["sni"],
+                    "all_working": found,   # ඔක්කොම working candidates
+                }
+            else:
+                methods["sni_mismatch"] = {"works": False}
+        else:
+            r = method_sni_mismatch(hostname, bug_sni, 443, timeout)
+            if r.get("works"):
+                r["sni_used"] = bug_sni
+            methods["sni_mismatch"] = r
+    else:
+        methods["sni_mismatch"] = {"works": False}
 
     # 3. Empty SNI
     methods["sni_empty"] = method_sni_empty(hostname, 443, timeout) \
@@ -543,15 +621,23 @@ def display_results(results, domain):
     # ── Table 2: SNI Mismatch Detail ─────────────────────────────
     if mismatches:
         print(M + BOLD + f"\n[SNI-MISMATCH] Bug Contact Method Detail  ({len(mismatches)} hosts)\n" + W)
-        print(C + f"  {'HOST':<40} {'TLS':>8} {'CERT CN (Served)':<32} {'LATENCY':>9}" + W)
-        print(C + "  " + "─" * 95 + W)
+        print(C + f"  {'HOST':<40} {'SNI USED':<28} {'TLS':>8} {'CN (Served)':<28} {'LATENCY':>9}" + W)
+        print(C + "  " + "─" * 120 + W)
         for r in mismatches:
-            mm  = r["sni_methods"]["sni_mismatch"]
-            tls = mm.get("tls", "?")
-            cn  = mm.get("cn",  "?") or "?"
-            lat = f"{mm['latency']}ms" if mm.get('latency') else "?"
-            print(M + f"  {r['host']:<40}{W} {B}{tls:>8}{W} {cn:<32} {Y}{lat:>9}{W}")
-        print(M + "\n  ↑ SNI Mismatch method work වෙනවා — bug host candidate!" + W)
+            mm      = r["sni_methods"]["sni_mismatch"]
+            tls     = mm.get("tls",      "?")
+            cn      = mm.get("cn",       "?") or "?"
+            lat     = f"{mm['latency']}ms" if mm.get("latency") else "?"
+            sni_used= mm.get("sni_used", "?")
+            print(M + f"  {r['host']:<40}{W} {G}{sni_used:<28}{W} {B}{tls:>8}{W} {cn:<28} {Y}{lat:>9}{W}")
+
+            # auto mode නම් ඔක්කොම working candidates show කරනවා
+            all_w = mm.get("all_working", [])
+            if len(all_w) > 1:
+                print(DIM + f"  {'':>4} ↳ All working SNIs: " +
+                      ", ".join(f"{x['sni']}({x['latency']}ms)" for x in all_w) + W)
+
+        print(M + "\n  ↑ SNI Mismatch work වෙනවා — bug host confirmed!" + W)
 
     # ── Table 3: All Methods Matrix ──────────────────────────────
     METHODS_ORDER = ["direct_sni","sni_mismatch","sni_empty",
@@ -616,8 +702,13 @@ def scan_domain_menu(cfg):
     domain = input(Y + "  [+] Target Domain (e.g. dialog.lk) : " + W).strip()
     if not domain: return
 
-    bug_sni = input(Y + "  [+] SNI Mismatch test host (default: free.facebook.com) : " + W).strip()
-    if not bug_sni: bug_sni = "free.facebook.com"
+    bug_sni_raw = input(Y + "  [+] SNI Mismatch test host\n"
+                        "      (Enter = auto-detect | හෝ hostname type කරන්න) : " + W).strip()
+    bug_sni = bug_sni_raw if bug_sni_raw else "auto"
+    if bug_sni == "auto":
+        print(G + f"  [*] Auto mode — candidates {len(SNI_CANDIDATES)}ක් try කරනවා\n" + W)
+    else:
+        print(G + f"  [*] Manual mode — {bug_sni}\n" + W)
 
     print(C + "\n  [*] Override settings (Enter = use defaults):" + W)
     t  = input(Y + f"      Threads [{cfg['threads']}]: " + W).strip()
@@ -645,8 +736,9 @@ def single_host_menu(cfg):
     host = input(Y + "  [+] Host/Domain: " + W).strip()
     if not host: return
 
-    bug_sni = input(Y + "  [+] SNI Mismatch test host (default: free.facebook.com): " + W).strip()
-    if not bug_sni: bug_sni = "free.facebook.com"
+    bug_sni_raw = input(Y + "  [+] SNI Mismatch test host\n"
+                        "      (Enter = auto-detect | හෝ hostname type කරන්න) : " + W).strip()
+    bug_sni = bug_sni_raw if bug_sni_raw else "auto"
 
     print(C + f"\n  Scanning '{host}'...\n" + W)
     res = scan_host(host, cfg, bug_sni)
@@ -671,12 +763,25 @@ def single_host_menu(cfg):
     for mid, label in METHOD_LABELS.items():
         v = res["sni_methods"].get(mid, {})
         if v.get("works"):
-            tls = v.get("tls", "")
-            lat = f"{v.get('latency','?')}ms"
-            cn  = v.get("cn","") or ""
+            tls   = v.get("tls",     "")
+            lat   = f"{v.get('latency','?')}ms"
+            cn    = v.get("cn",      "") or ""
             extra = f"cn:{cn}" if cn and cn != '?' else ""
             extra += f"  code:{v.get('code','')}" if v.get('code') else ""
-            print(f"  {label:<24} {G}WORKS{W}      {tls:<10} {lat:<12} {DIM}{extra}{W}")
+
+            # sni_mismatch — use කළ SNI + ඔක්කොම working ඒවා show
+            if mid == "sni_mismatch":
+                sni_used = v.get("sni_used", "")
+                extra = f"sni_used:{G}{sni_used}{W}" if sni_used else extra
+                print(f"  {label:<24} {G}WORKS{W}      {tls:<10} {lat:<12} {extra}")
+                all_w = v.get("all_working", [])
+                if all_w:
+                    print(C + f"  {'':>4}↳ Working SNI candidates ({len(all_w)}):" + W)
+                    for x in all_w:
+                        print(G + f"  {'':>6}✔ {x['sni']:<30}{W} "
+                              f"{B}{x['tls']:<10}{W} {Y}{x['latency']}ms{W}")
+            else:
+                print(f"  {label:<24} {G}WORKS{W}      {tls:<10} {lat:<12} {DIM}{extra}{W}")
         else:
             print(f"  {label:<24} {R}no resp{W}")
 
@@ -706,8 +811,8 @@ def batch_scan_menu(cfg):
     with open(fpath) as f:
         domains = [l.strip() for l in f if l.strip() and not l.startswith('#')]
 
-    bug_sni = input(Y + "  [+] Bug SNI host (default: free.facebook.com): " + W).strip()
-    if not bug_sni: bug_sni = "free.facebook.com"
+    bug_sni_raw = input(Y + "  [+] SNI Mismatch test host (Enter = auto-detect): " + W).strip()
+    bug_sni = bug_sni_raw if bug_sni_raw else "auto"
 
     print(G + f"  [+] Domains: {len(domains)}\n" + W)
 
