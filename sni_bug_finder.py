@@ -26,6 +26,133 @@ def sp(text):
     with print_lock:
         print(text)
 
+# ================================================================
+#  Speed: DNS Pre-Resolve (Parallel Batch)
+# ================================================================
+def parallel_dns_resolve(hostnames, threads=50):
+    """Scan කලින් DNS batch resolve — dead hosts filter කරනවා"""
+    resolved = {}
+    lock = threading.Lock()
+    def resolve_one(h):
+        try:
+            ip = socket.gethostbyname(h)
+            with lock:
+                resolved[h] = ip
+        except: pass
+    with ThreadPoolExecutor(max_workers=min(threads, len(hostnames)+1)) as ex:
+        list(ex.map(resolve_one, hostnames))
+    return resolved
+
+# ================================================================
+#  Accuracy: Wildcard Detection
+# ================================================================
+def detect_wildcard(domain):
+    """random subdomain resolve වෙනවා නම් wildcard active"""
+    import random, string
+    rand = ''.join(random.choices(string.ascii_lowercase, k=14)) + '.' + domain
+    try:
+        return socket.gethostbyname(rand)
+    except:
+        return None
+
+# ================================================================
+#  Accuracy: Filter Dead + Wildcard Subdomains
+# ================================================================
+def filter_subdomains(subdomains, domain, ip_cache):
+    wildcard_ip = detect_wildcard(domain)
+    if wildcard_ip:
+        sp(Y + f"  [!] Wildcard *.{domain} = {wildcard_ip} — filter කරනවා" + W)
+    filtered, rm_dead, rm_wild = [], 0, 0
+    for h in subdomains:
+        ip = ip_cache.get(h)
+        if not ip:
+            rm_dead += 1; continue
+        if wildcard_ip and ip == wildcard_ip:
+            rm_wild += 1; continue
+        filtered.append(h)
+    sp(G + f"  [+] Filter: dead={rm_dead}  wildcard={rm_wild}  usable={len(filtered)}" + W)
+    return filtered, wildcard_ip
+
+# ================================================================
+#  Speed: Thread-local Session (Connection Pooling)
+# ================================================================
+_sess_local = threading.local()
+def get_session(cfg):
+    if not hasattr(_sess_local, 's'):
+        s = requests.Session()
+        s.headers['User-Agent'] = get_ua(cfg)
+        a = requests.adapters.HTTPAdapter(
+            pool_connections=10, pool_maxsize=20, max_retries=1)
+        s.mount('http://', a); s.mount('https://', a)
+        _sess_local.s = s
+    return _sess_local.s
+
+# ================================================================
+#  Speed: Adaptive Timeout
+# ================================================================
+def adaptive_timeout(base, latency_ms):
+    if latency_ms is None: return base
+    if latency_ms < 100:   return max(2, base - 1)
+    if latency_ms < 400:   return base
+    return base + 2
+
+# ================================================================
+#  Output: Milestone Live Table (every 25%)
+# ================================================================
+def milestone_table(done_results, pct, total):
+    bugs = [r for r in done_results if r["is_bug_host"]]
+    sp(C + f"\n  ── {pct}% ({len(done_results)}/{total}) Bug hosts found: {len(bugs)} ──" + W)
+    for r in sorted(bugs, key=lambda x: x["bug_score"], reverse=True)[:5]:
+        sc = G if r['bug_score'] >= 70 else Y
+        ms = ' '.join(METHOD_LABELS.get(m, m) for m in r.get('working_methods', []))
+        sp(G + f"  ★ {r['host']:<42}" + sc + f" {r['bug_score']}%" + W + C + f" [{ms}]" + W)
+
+# ================================================================
+#  Output: Duplicate IP Filter + IP Grouping
+# ================================================================
+def dedup_by_ip(results):
+    """Same IP ═ highest score ek vitarai tiyaganava"""
+    best = {}
+    for r in results:
+        ip = r.get("ip")
+        if not ip:
+            continue
+        if ip not in best or r["bug_score"] > best[ip]["bug_score"]:
+            best[ip] = r
+    no_ip = [r for r in results if not r.get("ip")]
+    return list(best.values()) + no_ip
+
+def group_by_subnet(results):
+    """IP /24 subnet anuvа group"""
+    groups = {}
+    for r in results:
+        ip = r.get("ip", "")
+        subnet = '.'.join(ip.split('.')[:3]) + '.x' if ip else "unknown"
+        groups.setdefault(subnet, []).append(r)
+    return dict(sorted(groups.items(), key=lambda x: len(x[1]), reverse=True))
+
+# ================================================================
+#  Output: ASCII Stats Chart
+# ================================================================
+def ascii_chart(results):
+    total = len(results)
+    if not total: return
+    def bar(n, w=28):
+        f = int(w * n / total) if total else 0
+        return G + "█"*f + DIM + "░"*(w-f) + W + f"  {n}/{total}"
+    bug_c  = len([r for r in results if r["is_bug_host"]])
+    mm_c   = len([r for r in results if r["sni_methods"].get("sni_mismatch",{}).get("works")])
+    h2_c   = len([r for r in results if r["http2"]])
+    cdn_c  = len([r for r in results if r["cdn"]])
+    dead_c = len([r for r in results if not r["http_status"] and not r["https_status"]])
+    sp(C + BOLD + "\n  [STATS] Scan Summary\n" + W)
+    sp(C + f"  Bug Hosts     " + bar(bug_c))
+    sp(C + f"  SNI Mismatch  " + bar(mm_c))
+    sp(C + f"  HTTP/2        " + bar(h2_c))
+    sp(C + f"  CDN Detected  " + bar(cdn_c))
+    sp(C + f"  Unreachable   " + bar(dead_c))
+
+
 # ── Config ────────────────────────────────────────────────────────
 CONFIG_FILE = "sni_config.json"
 DEFAULT_CONFIG = {
@@ -472,10 +599,10 @@ def detect_cdn(headers):
 # ================================================================
 #  Full Host Scanner
 # ================================================================
-def scan_host(hostname, cfg, bug_sni):
+def scan_host(hostname, cfg, bug_sni, pre_resolved_ip=None):
     result = {
         "host":             hostname,
-        "ip":               None,
+        "ip":               pre_resolved_ip,
         "http_status":      None,
         "https_status":     None,
         "server":           None,
@@ -488,26 +615,28 @@ def scan_host(hostname, cfg, bug_sni):
         "is_bug_host":      False,
         "redirect_to":      None,
         "latency_ms":       None,
+        "retry":            False,
     }
     timeout = cfg["timeout"]
-    hdrs    = {"User-Agent": get_ua(cfg)}
+    sess    = get_session(cfg)
 
-    # IP resolve
-    try:
-        result["ip"] = socket.gethostbyname(hostname)
-    except: pass
+    # IP resolve (cache miss ems)
+    if not result["ip"]:
+        try:
+            result["ip"] = socket.gethostbyname(hostname)
+        except: pass
 
     # Port scan
     result["open_ports"] = scan_ports(hostname, cfg["ports"], timeout) \
         if cfg["check_ports"] else {80: 0, 443: 0}
     op = result["open_ports"]
 
-    # HTTP
+    # HTTP  (connection pool reuse)
     if 80 in op or not cfg["check_ports"]:
         try:
             t0 = time.time()
-            r  = requests.get(f"http://{hostname}", timeout=timeout,
-                              allow_redirects=True, headers=hdrs, verify=False)
+            r  = sess.get(f"http://{hostname}", timeout=timeout,
+                          allow_redirects=True, verify=False)
             result["http_status"] = r.status_code
             result["latency_ms"]  = int((time.time() - t0) * 1000)
             result["server"]      = r.headers.get('Server', '')
@@ -516,11 +645,14 @@ def scan_host(hostname, cfg, bug_sni):
                 result["redirect_to"] = r.url
         except: pass
 
+    # Adaptive timeout after first latency measure
+    timeout = adaptive_timeout(timeout, result["latency_ms"])
+
     # HTTPS
     if cfg["check_https"] and (443 in op or not cfg["check_ports"]):
         try:
-            r2 = requests.get(f"https://{hostname}", timeout=timeout,
-                              allow_redirects=True, headers=hdrs, verify=False)
+            r2 = sess.get(f"https://{hostname}", timeout=timeout,
+                          allow_redirects=True, verify=False)
             result["https_status"] = r2.status_code
             if not result["server"]:
                 result["server"] = r2.headers.get('Server', '')
@@ -558,28 +690,84 @@ def scan_host(hostname, cfg, bug_sni):
 # ================================================================
 #  Multi-threaded Runner
 # ================================================================
-def run_scan(subdomains, cfg, bug_sni):
-    results = []
-    counter = {"n": 0}
-    total   = len(subdomains)
+def run_scan(subdomains, cfg, bug_sni, domain=""):
+    total    = len(subdomains)
+    results  = []
+    counter  = {"n": 0, "errors": 0}
+    milestones_hit = set()
+    t_start  = time.time()
 
     print(C + f"\n  Threads:{cfg['threads']} | Timeout:{cfg['timeout']}s "
-              f"| Bug-SNI:{bug_sni}\n" + W)
+              f"| Bug-SNI:{bug_sni} | Hosts:{total}" + W)
+
+    # ── Step 1: DNS Pre-Resolve (parallel) ──────────────────────
+    print(C + "\n  [1/3] DNS pre-resolving..." + W, end='', flush=True)
+    ip_cache = parallel_dns_resolve(subdomains, threads=min(80, total+1))
+    resolved_count = len(ip_cache)
+    print(G + f" {resolved_count}/{total} resolved" + W)
+
+    # ── Step 2: Filter dead + wildcard ──────────────────────────
+    print(C + "  [2/3] Filtering dead & wildcard subdomains..." + W)
+    if domain:
+        subdomains, _ = filter_subdomains(subdomains, domain, ip_cache)
+    else:
+        subdomains = [h for h in subdomains if h in ip_cache]
+    total = len(subdomains)
+    if not total:
+        print(R + "  [-] Usable subdomains නෑ!" + W)
+        return []
+
+    print(C + f"  [3/3] Scanning {total} hosts...\n" + W)
     print(C + "  " + "─" * 88 + W)
 
+    # ── Step 3: Multi-thread scan ────────────────────────────────
     def worker(h):
-        res = scan_host(h, cfg, bug_sni)
-        counter["n"] += 1
-        progress_bar(counter["n"], total, "Scanning")
+        pre_ip = ip_cache.get(h)
+        res    = scan_host(h, cfg, bug_sni, pre_resolved_ip=pre_ip)
+        n = counter["n"] + 1
+        counter["n"] = n
+
+        # ETA calculation
+        elapsed = time.time() - t_start
+        speed   = n / elapsed if elapsed > 0 else 1
+        eta_s   = int((total - n) / speed) if speed > 0 else 0
+        eta_str = f"ETA:{eta_s}s" if eta_s < 9999 else ""
+        progress_bar(n, total, f"Scanning {eta_str}")
+
+        # Milestone tables at 25%, 50%, 75%
+        pct = int(n / total * 100)
+        for mp in [25, 50, 75]:
+            if pct >= mp and mp not in milestones_hit:
+                milestones_hit.add(mp)
+                milestone_table(results[:], mp, total)
         return res
 
     with ThreadPoolExecutor(max_workers=cfg["threads"]) as ex:
-        for fut in as_completed({ex.submit(worker, s): s for s in subdomains}):
+        futs = {ex.submit(worker, s): s for s in subdomains}
+        for fut in as_completed(futs):
             try:
-                results.append(fut.result())
-            except: pass
+                r = fut.result()
+                # Retry once if no response at all
+                if not r["http_status"] and not r["https_status"] and not r["open_ports"]:
+                    r2 = scan_host(r["host"], cfg, bug_sni,
+                                   pre_resolved_ip=ip_cache.get(r["host"]))
+                    r2["retry"] = True
+                    results.append(r2)
+                else:
+                    results.append(r)
+            except:
+                counter["errors"] += 1
 
     print()
+
+    # ── Dedup same-IP hosts ──────────────────────────────────────
+    before_dedup = len(results)
+    results = dedup_by_ip(results)
+    dedup_removed = before_dedup - len(results)
+
+    if dedup_removed:
+        print(Y + f"  [*] Duplicate IP filter: {dedup_removed} same-server hosts removed" + W)
+
     results.sort(key=lambda x: x["bug_score"], reverse=True)
     return results
 
@@ -694,6 +882,22 @@ def display_results(results, domain):
             print(C + f"      Score:{score_color(r['bug_score'])}{r['bug_score']}%{W}  "
                   f"Methods:{G} {methods}{W}\n")
 
+    # ── Subnet / IP Grouping ──────────────────────────────────────
+    subnet_groups = group_by_subnet(results)
+    if len(subnet_groups) > 1:
+        print(B + BOLD + f"\n[SUBNETS] IP Range Grouping\n" + W)
+        print(C + f"  {'SUBNET':<18} {'HOSTS':>6} {'BUG HOSTS':>10} {'BEST SCORE':>11}" + W)
+        print(C + "  " + "─" * 50 + W)
+        for subnet, group in list(subnet_groups.items())[:15]:
+            bugs_in = [r for r in group if r["is_bug_host"]]
+            best    = max(group, key=lambda x: x["bug_score"])["bug_score"]
+            sc      = score_color(best)
+            print(f"  {B}{subnet:<18}{W} {len(group):>6} {G}{len(bugs_in):>10}{W} "
+                  + sc + f"{best:>10}%{W}")
+
+    # ── ASCII Stats Chart ─────────────────────────────────────────
+    ascii_chart(results)
+
 # ================================================================
 #  Domain Scan Menu
 # ================================================================
@@ -723,7 +927,7 @@ def scan_domain_menu(cfg):
 
     print(G + f"\n  [+] Subdomains: {len(subdomains)}  Bug-SNI: {bug_sni}\n" + W)
     t0      = time.time()
-    results = run_scan(subdomains, cfg, bug_sni)
+    results = run_scan(subdomains, cfg, bug_sni, domain=domain)
     print(C + f"\n  Scan time: {time.time()-t0:.1f}s\n" + W)
     display_results(results, domain)
     input(Y + "\n  [!] Enter ඔබන්න..." + W)
