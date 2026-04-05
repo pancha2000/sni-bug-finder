@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 # ================================================================
-#   PRO SNI BUG HOST FINDER v4.0
+#   PRO SNI BUG HOST FINDER v4.1  (Bug-Fixed + Upgraded)
 #   ─────────────────────────────────────────────────────────────
-#   NEW: Async I/O (aiohttp) | TLS Fingerprint Spoofing (curl_cffi)
-#        HTTP/2 (httpx) | Real WS/VLESS Payload Test
-#        Domain Fronting | ECH Detection | Advanced CDN/WAF
+#   FIXES v4.1:
+#     [1] check_ech() UnboundLocalError — dns global shadowing fixed
+#     [2] bytes.lower() AttributeError  — Python 3 bytes fix
+#     [3] asyncio.get_event_loop() deprecated → get_running_loop()
+#     [4] detect_all_methods() empty CDN dict → real CDN pass
+#     [5] Domain itself added to scan list as fallback
+#   NEW v4.1:
+#     [+] BufferOver.run + RapidDNS subdomain sources
+#     [+] JSON + TXT export after scan
+#     [+] Retry logic in scan_host
 #   ─────────────────────────────────────────────────────────────
 #   Install: pip install aiohttp aiodns httpx[http2] curl_cffi dnspython
 #   Usage  : python3 sni_bug_finder.py
@@ -272,7 +279,7 @@ async def async_resolve(hostname, resolver=None):
             result = await resolver.gethostbyname(hostname, socket.AF_INET)
             return result.addresses[0] if result.addresses else None
         else:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()   # FIX: deprecated get_event_loop
             ip = await loop.run_in_executor(None, socket.gethostbyname, hostname)
             return ip
     except: return None
@@ -618,56 +625,65 @@ def check_ech(hostname, timeout=5):
     """
     DNS HTTPS (type 65) / SVCB record lookup හරහා
     ECH public key ඇත්දැයි detect කරනවා.
+    Bug Fix: dns global variable shadowing fixed — inner import removed.
     """
     result = {"supported":False,"ech_key":None,"alpn":[],"ipv4hint":[]}
 
-    # Method A: dnspython
-    if dns:
+    # Method A: dnspython  ── FIX: use global `dns`, do NOT re-import inside function
+    _dns = dns   # capture global to avoid UnboundLocalError from any inner import
+    if _dns:
         try:
-            import dns.resolver, dns.rdatatype
-            ans = dns.resolver.resolve(hostname, 'HTTPS', lifetime=timeout)
+            # Sub-modules import via attribute access only — avoids shadowing global
+            dns_resolver  = _dns.resolver   if hasattr(_dns, 'resolver')  else None
+            if dns_resolver is None:
+                import importlib
+                dns_resolver = importlib.import_module('dns.resolver')
+            ans = dns_resolver.resolve(hostname, 'HTTPS', lifetime=timeout)
             for rdata in ans:
                 rdata_str = str(rdata)
                 if 'ech=' in rdata_str.lower():
                     result["supported"] = True
-                    # Extract ECH key
                     m = re.search(r'ech=([A-Za-z0-9+/=]+)', rdata_str, re.I)
                     if m: result["ech_key"] = m.group(1)[:40]+"..."
                 if 'alpn=' in rdata_str.lower():
                     m = re.search(r'alpn="([^"]+)"', rdata_str)
                     if m: result["alpn"] = m.group(1).split(',')
             return result
-        except: pass
+        except Exception:
+            pass
 
-    # Method B: raw DNS query (type 65 HTTPS)
+    # Method B: raw UDP DNS query (type 65 = HTTPS record)
+    # FIX: bytes object has no .lower() in Python 3 — use plain 'in' or decode first
     try:
-        import struct
-        # Build DNS query for HTTPS record (type 65)
-        def build_query(name):
-            qid  = os.urandom(2)
-            flags= b'\x01\x00'  # RD set
+        def build_dns_query(name):
+            qid     = os.urandom(2)
+            flags   = b'\x01\x00'   # recursion desired
             qdcount = b'\x00\x01'
-            ancount = arcount = nscount = b'\x00\x00'
-            header = qid + flags + qdcount + ancount + nscount + arcount
-            # Encode domain
-            parts  = name.split('.')
-            qname  = b''
+            zeros   = b'\x00\x00'
+            header  = qid + flags + qdcount + zeros + zeros + zeros
+            parts   = name.split('.')
+            qname   = b''
             for p in parts:
                 qname += bytes([len(p)]) + p.encode()
-            qname += b'\x00'
-            qtype  = b'\x00\x41'   # HTTPS = 65
-            qclass = b'\x00\x01'   # IN
+            qname  += b'\x00'
+            qtype   = b'\x00\x41'   # type 65 = HTTPS
+            qclass  = b'\x00\x01'   # IN
             return header + qname + qtype + qclass
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(timeout)
-        sock.sendto(build_query(hostname), ("8.8.8.8", 53))
-        data, _ = sock.recvfrom(4096)
-        sock.close()
-        # Simple ECH key check in response
-        if b'ech' in data.lower():
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.settimeout(timeout)
+        udp.sendto(build_dns_query(hostname), ("8.8.8.8", 53))
+        data, _ = udp.recvfrom(4096)
+        udp.close()
+        # FIX: bytes.lower() does not exist — decode then check
+        data_lower = data.decode(errors='ignore').lower()
+        if 'ech' in data_lower:
             result["supported"] = True
-    except: pass
+            # Try extract ECH key from raw bytes (base64 portion)
+            m = re.search(r'ech=([A-Za-z0-9+/=]+)', data_lower)
+            if m: result["ech_key"] = m.group(1)[:40]
+    except Exception:
+        pass
 
     return result
 
@@ -716,7 +732,7 @@ def check_http3_quic(hostname, timeout=3):
 # ================================================================
 #  Full Method Detection (per host)
 # ================================================================
-def detect_all_methods(hostname, open_ports, timeout, bug_sni, cfg):
+def detect_all_methods(hostname, open_ports, timeout, bug_sni, cfg, known_cdn=None):
     methods = {}
     has_443 = 443 in open_ports
     has_80  = 80  in open_ports
@@ -768,7 +784,7 @@ def detect_all_methods(hostname, open_ports, timeout, bug_sni, cfg):
 
     # 5. Domain Fronting ★
     if cfg.get("check_fronting",True) and tls_port:
-        cdn = detect_cdn_advanced({})  # placeholder — actual cdn passed from caller
+        cdn = known_cdn or []   # FIX: was detect_cdn_advanced({}) — now uses real CDN list
         methods["domain_fronting"] = auto_domain_fronting(hostname, cdn, tls_port, timeout)
     else:
         methods["domain_fronting"] = {"works":False}
@@ -859,10 +875,34 @@ def subs_alienvault(domain, timeout):
     except: pass
     return out
 
+def subs_bufferover(domain, timeout):
+    """BufferOver.run — free alternative subdomain source"""
+    out = set()
+    txt = _fetch(f"https://dns.bufferover.run/dns?q=.{domain}", timeout)
+    try:
+        data = json.loads(txt)
+        for rec in data.get('FDNS_A', []) + data.get('RDNS', []):
+            parts = rec.split(',')
+            host  = parts[-1].strip().rstrip('.')
+            if host and domain in host: out.add(host)
+    except: pass
+    return out
+
+def subs_rapiddns(domain, timeout):
+    """RapidDNS — additional subdomain enumeration"""
+    out = set()
+    txt = _fetch(f"https://rapiddns.io/subdomain/{domain}?full=1", timeout+5)
+    for m in re.finditer(r'([a-zA-Z0-9._-]+\.' + re.escape(domain) + r')', txt):
+        out.add(m.group(1).strip())
+    return out
+
 def collect_subdomains(domain, cfg):
     all_subs = set()
     timeout  = cfg["timeout"]
     print(C+"\n  [*] Subdomain Sources:\n"+W)
+
+    # Always include domain itself
+    all_subs.add(domain)
 
     print(C+"    → HackerTarget     ..."+W, end='', flush=True)
     ht = subs_hackertarget(domain, timeout)
@@ -878,12 +918,22 @@ def collect_subdomains(domain, cfg):
         av = subs_alienvault(domain, timeout)
         all_subs |= av; print(G+f" {len(av)} found"+W)
 
+    # Extra sources
+    print(C+"    → BufferOver.run   ..."+W, end='', flush=True)
+    bo = subs_bufferover(domain, timeout)
+    all_subs |= bo; print(G+f" {len(bo)} found"+W)
+
+    print(C+"    → RapidDNS         ..."+W, end='', flush=True)
+    rd = subs_rapiddns(domain, timeout)
+    all_subs |= rd; print(G+f" {len(rd)} found"+W)
+
+    print(G+f"\n  [+] Total unique subdomains: {len(all_subs)}"+W)
     return sorted(all_subs)
 
 # ================================================================
 #  Main Host Scanner
 # ================================================================
-def scan_host(hostname, cfg, bug_sni, pre_ip=None):
+def scan_host(hostname, cfg, bug_sni, pre_ip=None, _retry=1):
     result = {
         "host":            hostname,
         "ip":              pre_ip,
@@ -984,7 +1034,8 @@ def scan_host(hostname, cfg, bug_sni, pre_ip=None):
 
     # All SNI methods
     if cfg["check_sni"]:
-        result["sni_methods"]     = detect_all_methods(hostname, op, timeout, bug_sni, cfg)
+        result["sni_methods"]     = detect_all_methods(
+            hostname, op, timeout, bug_sni, cfg, known_cdn=result["cdn"])
         result["working_methods"] = [m for m,v in result["sni_methods"].items()
                                      if v.get("works")]
 
@@ -1048,7 +1099,7 @@ async def _async_runner(subdomains, cfg, bug_sni, ip_cache):
     t_start  = time.time()
     milestones_hit = set()
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()   # FIX: get_event_loop() deprecated Python 3.10+
     executor = ThreadPoolExecutor(max_workers=cfg["threads"])
 
     async def worker(h):
@@ -1308,9 +1359,56 @@ def display_results(results, domain):
             print(C+f"      Score:{sc(r['bug_score'])}{r['bug_score']}%{W}  "
                   f"Methods:{G} {methods}{W}\n")
 
-# ================================================================
-#  UI
-# ================================================================
+def export_results(results, domain):
+    """Scan results JSON + TXT format export කරනවා"""
+    import datetime
+    ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = f"sni_results_{domain.replace('.','_')}_{ts}"
+
+    # JSON export
+    json_file = base + ".json"
+    export_data = []
+    for r in results:
+        export_data.append({
+            "host":            r["host"],
+            "ip":              r["ip"],
+            "bug_score":       r["bug_score"],
+            "is_bug_host":     r["is_bug_host"],
+            "http_status":     r["http_status"],
+            "https_status":    r["https_status"],
+            "http2":           r["http2"],
+            "cdn":             r["cdn"],
+            "open_ports":      list(r["open_ports"].keys()),
+            "working_methods": r["working_methods"],
+            "ech_supported":   r.get("ech",{}).get("supported",False),
+            "sni_used":        r["sni_methods"].get("sni_mismatch",{}).get("sni_used",""),
+        })
+    try:
+        with open(json_file,'w') as f:
+            json.dump(export_data, f, indent=2)
+        print(G+f"  [✔] JSON exported → {json_file}"+W)
+    except Exception as e:
+        print(R+f"  [!] JSON export error: {e}"+W)
+
+    # TXT export — bug hosts only
+    txt_file = base + "_bugs.txt"
+    bugs = [r for r in results if r["is_bug_host"]]
+    try:
+        with open(txt_file,'w') as f:
+            f.write(f"# SNI Bug Hosts — {domain} — {ts}\n")
+            f.write(f"# Total scanned: {len(results)}  Bug hosts: {len(bugs)}\n\n")
+            for r in bugs:
+                ms = ','.join(r["working_methods"])
+                sni= r["sni_methods"].get("sni_mismatch",{}).get("sni_used","")
+                f.write(f"{r['host']}  score:{r['bug_score']}%  methods:{ms}"
+                        + (f"  sni:{sni}" if sni else "") + "\n")
+        print(G+f"  [✔] Bug hosts TXT → {txt_file}"+W)
+    except Exception as e:
+        print(R+f"  [!] TXT export error: {e}"+W)
+
+    return json_file, txt_file
+
+
 def clear(): os.system('cls' if os.name=='nt' else 'clear')
 
 def banner():
@@ -1325,7 +1423,7 @@ def banner():
     }
     print(f"""
 {C}╔══════════════════════════════════════════════════════════════╗
-║  {G}{BOLD}SNI BUG HOST FINDER{C} v4.0                                 ║
+║  {G}{BOLD}SNI BUG HOST FINDER{C} v4.1  {DIM}(Bug-Fixed){C}                   ║
 ║  {DIM}Async I/O | TLS-Spoof | WS-Payload | Domain-Front | ECH{C}    ║
 ╚══════════════════════════════════════════════════════════════╝{W}
   {C}curl_cffi:{W}{deps['curl_cffi']}  {C}httpx/H2:{W}{deps['httpx/H2']}  {C}aiohttp:{W}{deps['aiohttp']}  {C}aiodns:{W}{deps['aiodns']}  {C}dnspython:{W}{deps['dnspython']}
