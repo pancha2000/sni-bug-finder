@@ -276,12 +276,17 @@ def http2_get(hostname, timeout=5):
 async def async_resolve(hostname, resolver=None):
     try:
         if resolver:
-            # Termux Warning එක නැති කිරීමට query() භාවිතා කිරීම
-            result = await resolver.query(hostname, 'A')
-            return result[0].host if result else None
+            # FIX: query() deprecated in newer aiodns → use query_dns() with fallback
+            try:
+                result = await resolver.query_dns(hostname, 'A')
+                hosts  = [r.host for r in result.get('A', [])]
+                return hosts[0] if hosts else None
+            except AttributeError:
+                result = await resolver.query(hostname, 'A')
+                return result[0].host if result else None
         else:
-            loop = asyncio.get_event_loop()
-            res = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
+            loop = asyncio.get_running_loop()
+            res  = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
             return res[0][4][0] if res else None
     except: return None
 
@@ -398,12 +403,31 @@ def method_sni_mismatch(real_host, sni_host, port, timeout):
     return {"works":False}
 
 def auto_detect_sni_mismatch(hostname, port, timeout):
+    """
+    SPEED FIX: Serial loop 31×5s=155s → Parallel threads, 2s timeout, early exit.
+    3 working SNI found වූ වහාම stop කරනවා.
+    """
     working = []
-    for candidate in SNI_CANDIDATES:
-        r = method_sni_mismatch(hostname, candidate, port, timeout)
+    w_lock  = threading.Lock()
+    stop_ev = threading.Event()
+    fast_to = min(timeout, 2)   # 2s per attempt — TLS handshake fast enough
+
+    def try_one(candidate):
+        if stop_ev.is_set():
+            return
+        r = method_sni_mismatch(hostname, candidate, port, fast_to)
         if r.get("works"):
             r["sni"] = candidate
-            working.append(r)
+            with w_lock:
+                working.append(r)
+                if len(working) >= 3:   # 3 results enough — stop early
+                    stop_ev.set()
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE, wait as _wait
+    with _TPE(max_workers=16) as ex:
+        futs = [ex.submit(try_one, c) for c in SNI_CANDIDATES]
+        _wait(futs, timeout=fast_to + 1)   # overall max wait
+
     return working
 
 # ================================================================
@@ -539,8 +563,7 @@ def method_domain_fronting(real_host, front_sni, real_backend, port, timeout):
 
 def auto_domain_fronting(hostname, cdn_list, port, timeout):
     """
-    CDN detected නම් common front-SNI candidates try කරනවා.
-    CDN IP (hostname) → front_sni (free domain) → Host: backend
+    SPEED FIX: Serial 6×5s=30s → Parallel threads, 2s timeout, 3 candidates only.
     """
     front_candidates = [
         "free.facebook.com","zero.facebook.com",
@@ -549,13 +572,27 @@ def auto_domain_fronting(hostname, cdn_list, port, timeout):
         "zoom.us","discord.com",
         "www.speedtest.net",
     ]
-    working = []
-    for front in front_candidates[:6]:
-        # backend ලෙස ours hostname (real target) use
-        r = method_domain_fronting(hostname, front, hostname, port, timeout)
+    fast_to  = min(timeout, 2)
+    result   = {"works": False}
+    r_lock   = threading.Lock()
+    found_ev = threading.Event()
+
+    def try_front(front):
+        if found_ev.is_set():
+            return
+        r = method_domain_fronting(hostname, front, hostname, port, fast_to)
         if r.get("works"):
-            working.append(r)
-    return working[0] if working else {"works":False}
+            with r_lock:
+                if not found_ev.is_set():
+                    result.update(r)
+                    found_ev.set()
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE, wait as _wait
+    with _TPE(max_workers=6) as ex:
+        futs = [ex.submit(try_front, f) for f in front_candidates[:6]]
+        _wait(futs, timeout=fast_to + 1)
+
+    return result
 
 # ================================================================
 #  SNI Method 6: VLESS Protocol Probe  ★ NEW
@@ -943,6 +980,10 @@ def collect_subdomains(domain, cfg):
 #  Main Host Scanner
 # ================================================================
 def scan_host(hostname, cfg, bug_sni, pre_ip=None, _retry=1):
+    """
+    SPEED FIX: Per-method timeouts short කළා.
+    auto_detect_sni_mismatch + auto_domain_fronting parallel කළා.
+    """
     result = {
         "host":            hostname,
         "ip":              pre_ip,
