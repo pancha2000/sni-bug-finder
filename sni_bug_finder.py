@@ -1561,7 +1561,7 @@ def deps_menu():
     ]
     missing = []
     for pkg, desc in deps_info:
-        mod = pkg.split('[')[0].replace('-','_')
+        mod = 'dns' if pkg == 'dnspython' else pkg.split('[')[0].replace('-','_')
         ok  = _try_import(mod) is not None
         status = G+"✔ installed"+W if ok else R+"✘ missing"+W
         print(f"  {pkg:<20} {status}  {DIM}{desc}{W}")
