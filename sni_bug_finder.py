@@ -1,67 +1,312 @@
 #!/usr/bin/env python3
 # ================================================================
-#   PRO SNI BUG HOST FINDER v3.0
-#   Features: Multi-thread | SNI Method Detection | Port Scan
-#             CDN Detect | Cipher Suite | HTTP/2 | Batch Scan
-#             Config File | 3 Subdomain Sources | Latency Measure
-#   Usage: python3 sni_bug_finder.py
+#   PRO SNI BUG HOST FINDER v4.0
+#   ─────────────────────────────────────────────────────────────
+#   NEW: Async I/O (aiohttp) | TLS Fingerprint Spoofing (curl_cffi)
+#        HTTP/2 (httpx) | Real WS/VLESS Payload Test
+#        Domain Fronting | ECH Detection | Advanced CDN/WAF
+#   ─────────────────────────────────────────────────────────────
+#   Install: pip install aiohttp aiodns httpx[http2] curl_cffi dnspython
+#   Usage  : python3 sni_bug_finder.py
 # ================================================================
+from __future__ import annotations
+import asyncio, socket, ssl, os, sys, time, json, threading, re, struct
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Dict, List
 
-import requests, socket, ssl, os, sys, time, json, threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# ── Optional dependency loader ────────────────────────────────────
+def _try_import(name, pkg=None):
+    import importlib
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        return None
 
-# ── Colors ───────────────────────────────────────────────────────
-G    = '\033[92m'
-R    = '\033[91m'
-C    = '\033[96m'
-Y    = '\033[93m'
-B    = '\033[94m'
-M    = '\033[95m'
-W    = '\033[0m'
-BOLD = '\033[1m'
-DIM  = '\033[2m'
+aiohttp   = _try_import("aiohttp")
+aiodns    = _try_import("aiodns")
+httpx     = _try_import("httpx")
+curl_cffi = _try_import("curl_cffi")
+dns       = _try_import("dns")        # dnspython
+requests  = _try_import("requests")
 
-print_lock = threading.Lock()
-def sp(text):
-    with print_lock:
-        print(text)
+# ── Colors ────────────────────────────────────────────────────────
+G='\033[92m'; R='\033[91m'; C='\033[96m'; Y='\033[93m'
+B='\033[94m'; M='\033[95m'; W='\033[0m'; BOLD='\033[1m'; DIM='\033[2m'
+
+plock = threading.Lock()
+def sp(t):
+    with plock: print(t)
 
 # ================================================================
-#  Speed: DNS Pre-Resolve (Parallel Batch)
+#  Config
 # ================================================================
-def parallel_dns_resolve(hostnames, threads=50):
-    """Scan කලින් DNS batch resolve — dead hosts filter කරනවා"""
-    resolved = {}
-    lock = threading.Lock()
-    def resolve_one(h):
+CONFIG_FILE = "sni_config.json"
+DEFAULT_CFG = {
+    "threads":           50,
+    "timeout":           5,
+    "async_concurrency": 200,
+    "check_https":       True,
+    "check_sni":         True,
+    "check_ports":       True,
+    "check_http2":       True,
+    "check_http3":       False,
+    "check_ws_payload":  True,
+    "check_fronting":    True,
+    "check_ech":         True,
+    "use_crtsh":         True,
+    "use_alienvault":    True,
+    "tls_fingerprint":   "chrome120",
+    "ports": [80,443,8080,8443,2052,2053,2082,2083,2086,2087,2095,2096],
+    "user_agents": [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    ],
+    "tls_profiles": ["chrome120","chrome110","firefox120","safari17","edge120"],
+}
+
+def load_cfg():
+    if os.path.exists(CONFIG_FILE):
         try:
-            ip = socket.gethostbyname(h)
-            with lock:
-                resolved[h] = ip
+            with open(CONFIG_FILE) as f:
+                return {**DEFAULT_CFG, **json.load(f)}
         except: pass
-    with ThreadPoolExecutor(max_workers=min(threads, len(hostnames)+1)) as ex:
-        list(ex.map(resolve_one, hostnames))
+    return DEFAULT_CFG.copy()
+
+def save_cfg(cfg):
+    with open(CONFIG_FILE,'w') as f:
+        json.dump(cfg, f, indent=2)
+    print(G+f"[+] Saved → {CONFIG_FILE}"+W)
+
+# ================================================================
+#  CDN / WAF Signatures  (Advanced multi-signal)
+# ================================================================
+CDN_WAF = {
+    "Cloudflare":     {
+        "headers":  ["cf-ray","cf-cache-status","cf-connecting-ip","cf-ipcountry"],
+        "server":   ["cloudflare"],
+        "cookies":  ["__cflb","__cfduid","cf_clearance"],
+        "asns":     ["AS13335"],
+    },
+    "Akamai":         {
+        "headers":  ["x-check-cacheable","x-akamai","akamai-cache-status","x-akamai-transformed"],
+        "server":   ["akamaighost","akamai"],
+        "cookies":  ["ak_bmsc","bm_sz"],
+        "asns":     ["AS20940"],
+    },
+    "AWS CloudFront": {
+        "headers":  ["x-amz-cf-id","x-amz-cf-pop","x-cache"],
+        "server":   ["cloudfront"],
+        "cookies":  [],
+        "asns":     ["AS16509"],
+    },
+    "Fastly":         {
+        "headers":  ["x-fastly","x-served-by","x-cache-hits","fastly-restarts"],
+        "server":   ["fastly"],
+        "cookies":  [],
+        "asns":     ["AS54113"],
+    },
+    "Google CDN":     {
+        "headers":  ["x-goog-generation","x-guploader-uploadid","x-google-backends"],
+        "server":   ["gws","sffe","google"],
+        "cookies":  [],
+        "asns":     ["AS15169"],
+    },
+    "Azure CDN":      {
+        "headers":  ["x-azure-ref","x-msedge-ref","x-ec-custom-error","x-fd-int-proxy-id"],
+        "server":   ["microsoft-iis","azure"],
+        "cookies":  [],
+        "asns":     ["AS8075"],
+    },
+    "Gcore":          {
+        "headers":  ["x-id","x-cache"],
+        "server":   ["gcore"],
+        "cookies":  [],
+        "asns":     ["AS199524"],
+    },
+    "Sucuri WAF":     {
+        "headers":  ["x-sucuri-id","x-sucuri-cache"],
+        "server":   ["sucuri"],
+        "cookies":  ["sucuri_cloudproxy_uuid"],
+        "asns":     [],
+    },
+    "Imperva/Incapsula": {
+        "headers":  ["x-iinfo","x-cdn"],
+        "server":   ["incapsula"],
+        "cookies":  ["incap_ses","visid_incap"],
+        "asns":     [],
+    },
+    "Varnish":        {
+        "headers":  ["x-varnish","via"],
+        "server":   ["varnish"],
+        "cookies":  [],
+        "asns":     [],
+    },
+    "Nginx":          {"headers":[],"server":["nginx"],"cookies":[],"asns":[]},
+    "Apache":         {"headers":[],"server":["apache"],"cookies":[],"asns":[]},
+    "LiteSpeed":      {"headers":[],"server":["litespeed"],"cookies":[],"asns":[]},
+    "OpenResty":      {"headers":[],"server":["openresty"],"cookies":[],"asns":[]},
+}
+
+def detect_cdn_advanced(headers: dict, cookies: str = "", ip: str = "") -> List[str]:
+    found = []
+    h_str = json.dumps(headers).lower()
+    c_str = cookies.lower()
+    srv   = headers.get("server","").lower()
+
+    for cdn, sigs in CDN_WAF.items():
+        matched = False
+        for hk in sigs["headers"]:
+            if hk in h_str: matched = True; break
+        if not matched:
+            for sv in sigs["server"]:
+                if sv in srv: matched = True; break
+        if not matched:
+            for ck in sigs["cookies"]:
+                if ck in c_str: matched = True; break
+        if matched:
+            found.append(cdn)
+    return list(set(found))
+
+# ================================================================
+#  SNI Candidates
+# ================================================================
+SNI_CANDIDATES = [
+    "free.facebook.com","zero.facebook.com","m.facebook.com","web.facebook.com",
+    "media.whatsapp.com","static.whatsapp.net","mmg.whatsapp.net",
+    "www.google.com","googleapis.com","gstatic.com","clients1.google.com",
+    "wap.opera.mini.net","compress.opera-mini.net",
+    "en.m.wikipedia.org","www.wikipedia.org",
+    "www.speedtest.net","fast.com",
+    "cloudflare.com","cdn.cloudflare.com","1.1.1.1",
+    "www.youtube.com","www.instagram.com",
+    "t.me","telegram.org","web.telegram.org",
+    "twitter.com","mobile.twitter.com",
+    "zoom.us","api.zoom.us",
+    "discord.com","gateway.discord.gg",
+]
+
+METHOD_LABELS = {
+    "direct_sni":         "Direct-SNI",
+    "sni_mismatch":       "SNI-Mismatch",
+    "sni_empty":          "Empty-SNI",
+    "http_upgrade":       "WS-Upgrade",
+    "ws_real_payload":    "WS-Payload★",
+    "domain_fronting":    "DomainFront★",
+    "http_connect":       "CONNECT",
+    "host_header_inject": "HostInject",
+    "vless_probe":        "VLESS-Probe",
+}
+
+# ================================================================
+#  TLS Fingerprint Spoofing  (curl_cffi)
+# ================================================================
+CURL_CFFI_PROFILES = {
+    "chrome120": "chrome120",
+    "chrome110": "chrome110",
+    "firefox120": "firefox120",
+    "safari17":  "safari17_0",
+    "edge120":   "edge120",
+}
+
+def _get_cffi_session(profile="chrome120"):
+    if not curl_cffi: return None
+    try:
+        from curl_cffi import requests as cffi_req
+        impersonate = CURL_CFFI_PROFILES.get(profile, "chrome120")
+        return cffi_req.Session(impersonate=impersonate)
+    except: return None
+
+# ── Thread-local sessions ─────────────────────────────────────────
+_sess_local = threading.local()
+
+def get_session(cfg):
+    """curl_cffi → requests fallback, thread-local"""
+    if not hasattr(_sess_local, 's'):
+        profile = cfg.get("tls_fingerprint", "chrome120")
+        cffi_s = _get_cffi_session(profile)
+        if cffi_s:
+            _sess_local.s      = cffi_s
+            _sess_local.is_cffi = True
+        elif requests:
+            s = requests.Session()
+            s.headers['User-Agent'] = _get_ua(cfg)
+            a = requests.adapters.HTTPAdapter(
+                pool_connections=10, pool_maxsize=20, max_retries=1)
+            s.mount('http://', a); s.mount('https://', a)
+            _sess_local.s      = s
+            _sess_local.is_cffi = False
+        else:
+            _sess_local.s       = None
+            _sess_local.is_cffi = False
+    return _sess_local.s, getattr(_sess_local, 'is_cffi', False)
+
+def _get_ua(cfg):
+    import random
+    return random.choice(cfg.get("user_agents", DEFAULT_CFG["user_agents"]))
+
+# ================================================================
+#  HTTP/2 Client  (httpx)
+# ================================================================
+def http2_get(hostname, timeout=5):
+    """httpx HTTP/2 request — protocol negotiate"""
+    if not httpx: return None, False
+    try:
+        with httpx.Client(http2=True, verify=False,
+                          timeout=timeout,
+                          follow_redirects=True) as client:
+            r = client.get(f"https://{hostname}")
+            is_h2 = r.http_version == "HTTP/2"
+            return r.status_code, is_h2
+    except: return None, False
+
+# ================================================================
+#  Async DNS Resolver
+# ================================================================
+async def async_resolve(hostname, resolver=None):
+    try:
+        if resolver:
+            result = await resolver.gethostbyname(hostname, socket.AF_INET)
+            return result.addresses[0] if result.addresses else None
+        else:
+            loop = asyncio.get_event_loop()
+            ip = await loop.run_in_executor(None, socket.gethostbyname, hostname)
+            return ip
+    except: return None
+
+async def async_batch_resolve(hostnames, concurrency=100):
+    """aiodns parallel DNS resolve"""
+    resolved = {}
+    resolver = None
+    if aiodns:
+        try:
+            resolver = aiodns.DNSResolver()
+        except: pass
+
+    sem = asyncio.Semaphore(concurrency)
+
+    async def one(h):
+        async with sem:
+            ip = await async_resolve(h, resolver)
+            if ip:
+                resolved[h] = ip
+
+    await asyncio.gather(*[one(h) for h in hostnames])
     return resolved
 
 # ================================================================
-#  Accuracy: Wildcard Detection
+#  Wildcard + Filter
 # ================================================================
-def detect_wildcard(domain):
-    """random subdomain resolve වෙනවා නම් wildcard active"""
+async def detect_wildcard_async(domain):
     import random, string
     rand = ''.join(random.choices(string.ascii_lowercase, k=14)) + '.' + domain
-    try:
-        return socket.gethostbyname(rand)
-    except:
-        return None
+    ip = await async_resolve(rand)
+    return ip  # None if no wildcard
 
-# ================================================================
-#  Accuracy: Filter Dead + Wildcard Subdomains
-# ================================================================
-def filter_subdomains(subdomains, domain, ip_cache):
-    wildcard_ip = detect_wildcard(domain)
-    if wildcard_ip:
-        sp(Y + f"  [!] Wildcard *.{domain} = {wildcard_ip} — filter කරනවා" + W)
+def filter_subdomains(subdomains, domain, ip_cache, wildcard_ip):
     filtered, rm_dead, rm_wild = [], 0, 0
     for h in subdomains:
         ip = ip_cache.get(h)
@@ -70,1028 +315,1236 @@ def filter_subdomains(subdomains, domain, ip_cache):
         if wildcard_ip and ip == wildcard_ip:
             rm_wild += 1; continue
         filtered.append(h)
-    sp(G + f"  [+] Filter: dead={rm_dead}  wildcard={rm_wild}  usable={len(filtered)}" + W)
-    return filtered, wildcard_ip
+    sp(G+f"  [+] Filter: dead={rm_dead}  wildcard={rm_wild}  usable={len(filtered)}"+W)
+    return filtered
 
 # ================================================================
-#  Speed: Thread-local Session (Connection Pooling)
+#  Port Scanner (async)
 # ================================================================
-_sess_local = threading.local()
-def get_session(cfg):
-    if not hasattr(_sess_local, 's'):
-        s = requests.Session()
-        s.headers['User-Agent'] = get_ua(cfg)
-        a = requests.adapters.HTTPAdapter(
-            pool_connections=10, pool_maxsize=20, max_retries=1)
-        s.mount('http://', a); s.mount('https://', a)
-        _sess_local.s = s
-    return _sess_local.s
-
-# ================================================================
-#  Speed: Adaptive Timeout
-# ================================================================
-def adaptive_timeout(base, latency_ms):
-    if latency_ms is None: return base
-    if latency_ms < 100:   return max(2, base - 1)
-    if latency_ms < 400:   return base
-    return base + 2
-
-# ================================================================
-#  Output: Milestone Live Table (every 25%)
-# ================================================================
-def milestone_table(done_results, pct, total):
-    bugs = [r for r in done_results if r["is_bug_host"]]
-    sp(C + f"\n  ── {pct}% ({len(done_results)}/{total}) Bug hosts found: {len(bugs)} ──" + W)
-    for r in sorted(bugs, key=lambda x: x["bug_score"], reverse=True)[:5]:
-        sc = G if r['bug_score'] >= 70 else Y
-        ms = ' '.join(METHOD_LABELS.get(m, m) for m in r.get('working_methods', []))
-        sp(G + f"  ★ {r['host']:<42}" + sc + f" {r['bug_score']}%" + W + C + f" [{ms}]" + W)
-
-# ================================================================
-#  Output: Duplicate IP Filter + IP Grouping
-# ================================================================
-def dedup_by_ip(results):
-    """Same IP ═ highest score ek vitarai tiyaganava"""
-    best = {}
-    for r in results:
-        ip = r.get("ip")
-        if not ip:
-            continue
-        if ip not in best or r["bug_score"] > best[ip]["bug_score"]:
-            best[ip] = r
-    no_ip = [r for r in results if not r.get("ip")]
-    return list(best.values()) + no_ip
-
-def group_by_subnet(results):
-    """IP /24 subnet anuvа group"""
-    groups = {}
-    for r in results:
-        ip = r.get("ip", "")
-        subnet = '.'.join(ip.split('.')[:3]) + '.x' if ip else "unknown"
-        groups.setdefault(subnet, []).append(r)
-    return dict(sorted(groups.items(), key=lambda x: len(x[1]), reverse=True))
-
-# ================================================================
-#  Output: ASCII Stats Chart
-# ================================================================
-def ascii_chart(results):
-    total = len(results)
-    if not total: return
-    def bar(n, w=28):
-        f = int(w * n / total) if total else 0
-        return G + "█"*f + DIM + "░"*(w-f) + W + f"  {n}/{total}"
-    bug_c  = len([r for r in results if r["is_bug_host"]])
-    mm_c   = len([r for r in results if r["sni_methods"].get("sni_mismatch",{}).get("works")])
-    h2_c   = len([r for r in results if r["http2"]])
-    cdn_c  = len([r for r in results if r["cdn"]])
-    dead_c = len([r for r in results if not r["http_status"] and not r["https_status"]])
-    sp(C + BOLD + "\n  [STATS] Scan Summary\n" + W)
-    sp(C + f"  Bug Hosts     " + bar(bug_c))
-    sp(C + f"  SNI Mismatch  " + bar(mm_c))
-    sp(C + f"  HTTP/2        " + bar(h2_c))
-    sp(C + f"  CDN Detected  " + bar(cdn_c))
-    sp(C + f"  Unreachable   " + bar(dead_c))
-
-
-# ── Config ────────────────────────────────────────────────────────
-CONFIG_FILE = "sni_config.json"
-DEFAULT_CONFIG = {
-    "threads":        20,
-    "timeout":        4,
-    "check_https":    True,
-    "check_sni":      True,
-    "check_ports":    True,
-    "check_http2":    True,
-    "use_crtsh":      True,
-    "use_alienvault": True,
-    "ports": [80, 443, 8080, 8443, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096],
-    "user_agents": [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36",
-        "curl/7.88.1",
-        "python-requests/2.28.0",
-        "okhttp/4.9.3"
-    ]
-}
-
-def load_config():
-    if os.path.exists(CONFIG_FILE):
+async def async_port_scan(hostname, ports, timeout):
+    open_ports = {}
+    async def check(p):
         try:
-            with open(CONFIG_FILE) as f:
-                return {**DEFAULT_CONFIG, **json.load(f)}
+            t0 = time.time()
+            _, w = await asyncio.wait_for(
+                asyncio.open_connection(hostname, p), timeout=timeout)
+            lat = int((time.time()-t0)*1000)
+            w.close()
+            open_ports[p] = lat
+        except: pass
+    await asyncio.gather(*[check(p) for p in ports])
+    return open_ports
+
+# ================================================================
+#  SNI Method 1: Direct SNI
+# ================================================================
+def method_direct_sni(hostname, port, timeout):
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_OPTIONAL
+        t0 = time.time()
+        with socket.create_connection((hostname,port),timeout=timeout) as s:
+            with ctx.wrap_socket(s, server_hostname=hostname) as ss:
+                lat  = int((time.time()-t0)*1000)
+                cert = ss.getpeercert() or {}
+                subj = dict(x[0] for x in cert.get('subject',[]))
+                san  = [v for t,v in cert.get('subjectAltName',[]) if t=='DNS']
+                cip  = ss.cipher()
+                return {
+                    "works":True,"tls":ss.version(),
+                    "cn":subj.get('commonName','?'),
+                    "san":san[:4],"expiry":cert.get('notAfter','?'),
+                    "cipher":cip[0] if cip else '?',
+                    "bits":cip[2] if cip and len(cip)>2 else '?',
+                    "latency":lat,
+                }
+    except: pass
+    return {"works":False}
+
+# ================================================================
+#  SNI Method 2: SNI Mismatch Auto-detect
+# ================================================================
+def method_sni_mismatch(real_host, sni_host, port, timeout):
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        t0 = time.time()
+        with socket.create_connection((real_host,port),timeout=timeout) as s:
+            with ctx.wrap_socket(s, server_hostname=sni_host) as ss:
+                lat  = int((time.time()-t0)*1000)
+                cert = ss.getpeercert(binary_form=False) or {}
+                subj = dict(x[0] for x in cert.get('subject',[])) if cert else {}
+                return {"works":True,"tls":ss.version(),
+                        "cn":subj.get('commonName','?'),"latency":lat}
+    except: pass
+    return {"works":False}
+
+def auto_detect_sni_mismatch(hostname, port, timeout):
+    working = []
+    for candidate in SNI_CANDIDATES:
+        r = method_sni_mismatch(hostname, candidate, port, timeout)
+        if r.get("works"):
+            r["sni"] = candidate
+            working.append(r)
+    return working
+
+# ================================================================
+#  SNI Method 3: Empty SNI
+# ================================================================
+def method_sni_empty(hostname, port, timeout):
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+        t0 = time.time()
+        with socket.create_connection((hostname,port),timeout=timeout) as s:
+            with ctx.wrap_socket(s, server_hostname=None) as ss:
+                return {"works":True,"tls":ss.version(),
+                        "latency":int((time.time()-t0)*1000)}
+    except: pass
+    return {"works":False}
+
+# ================================================================
+#  SNI Method 4: WebSocket Real Payload Test  ★ NEW
+# ================================================================
+def method_ws_real_payload(hostname, port, timeout, sni_host=None):
+    """
+    සැබෑ WebSocket handshake request — 101 Switching Protocols expect.
+    Plain TCP handshake ලෙස නොව, real WS payload test.
+    sni_host: SNI mismatch mode ගැනීමට (domain fronting + WS combined)
+    """
+    import base64, hashlib
+    # Random WS key
+    ws_key = base64.b64encode(os.urandom(16)).decode()
+
+    try:
+        use_tls = port in [443,8443,2053,2083,2087,2096]
+        t0 = time.time()
+
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            raw = socket.create_connection((hostname,port),timeout=timeout)
+            sni = sni_host or hostname
+            sock = ctx.wrap_socket(raw, server_hostname=sni)
+        else:
+            sock = socket.create_connection((hostname,port),timeout=timeout)
+
+        host_header = sni_host or hostname
+        req = (
+            f"GET / HTTP/1.1\r\n"
+            f"Host: {host_header}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"Origin: https://{host_header}\r\n\r\n"
+        )
+        sock.sendall(req.encode())
+        sock.settimeout(timeout)
+        resp = b""
+        try:
+            while b"\r\n\r\n" not in resp:
+                chunk = sock.recv(1024)
+                if not chunk: break
+                resp += chunk
+        except: pass
+        sock.close()
+
+        resp_str = resp.decode(errors='ignore')
+        lat = int((time.time()-t0)*1000)
+
+        if "101" in resp_str.split('\r\n')[0] if resp_str else False:
+            # Verify server WS accept key
+            expected = base64.b64encode(
+                hashlib.sha1((ws_key+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+            ).decode()
+            key_ok = expected in resp_str
+            return {"works":True,"latency":lat,"code":"101",
+                    "key_verified":key_ok,"response":resp_str[:120]}
+        elif "200" in resp_str[:20]:
+            return {"works":True,"latency":lat,"code":"200","response":resp_str[:120]}
+        elif resp_str:
+            code = resp_str.split(' ')[1] if len(resp_str.split(' '))>1 else '?'
+            return {"works":False,"code":code,"response":resp_str[:80]}
+    except: pass
+    return {"works":False}
+
+# ================================================================
+#  SNI Method 5: Domain Fronting  ★ NEW (Enhanced)
+# ================================================================
+def method_domain_fronting(real_host, front_sni, real_backend, port, timeout):
+    """
+    Domain Fronting:
+      TCP  → real_host (CDN IP)
+      SNI  → front_sni  (allowed/zero-rated domain)
+      Host → real_backend (actual target server)
+
+    CDN edges SNI දකිනවා, Host header ලෙස proxy කරනවා.
+    Cloudflare, Fastly, Akamai ඉහළ CDN ඒවා support කරනවා.
+    """
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        t0 = time.time()
+
+        with socket.create_connection((real_host,port),timeout=timeout) as s:
+            with ctx.wrap_socket(s, server_hostname=front_sni) as ss:
+                req = (
+                    f"GET / HTTP/1.1\r\n"
+                    f"Host: {real_backend}\r\n"
+                    f"User-Agent: Mozilla/5.0\r\n"
+                    f"Connection: close\r\n\r\n"
+                )
+                ss.sendall(req.encode())
+                ss.settimeout(timeout)
+                resp = b""
+                try:
+                    while True:
+                        c = ss.recv(2048)
+                        if not c: break
+                        resp += c
+                        if len(resp) > 4096: break
+                except: pass
+
+        lat  = int((time.time()-t0)*1000)
+        text = resp.decode(errors='ignore')
+        code = text.split(' ')[1] if len(text.split(' '))>1 else '?'
+
+        if code in ['200','301','302','307','308','101']:
+            return {"works":True,"code":code,"latency":lat,
+                    "front_sni":front_sni,"backend":real_backend,
+                    "response_snippet":text[:100]}
+    except: pass
+    return {"works":False}
+
+def auto_domain_fronting(hostname, cdn_list, port, timeout):
+    """
+    CDN detected නම් common front-SNI candidates try කරනවා.
+    CDN IP (hostname) → front_sni (free domain) → Host: backend
+    """
+    front_candidates = [
+        "free.facebook.com","zero.facebook.com",
+        "www.wikipedia.org","en.m.wikipedia.org",
+        "www.google.com","www.youtube.com",
+        "zoom.us","discord.com",
+        "www.speedtest.net",
+    ]
+    working = []
+    for front in front_candidates[:6]:
+        # backend ලෙස ours hostname (real target) use
+        r = method_domain_fronting(hostname, front, hostname, port, timeout)
+        if r.get("works"):
+            working.append(r)
+    return working[0] if working else {"works":False}
+
+# ================================================================
+#  SNI Method 6: VLESS Protocol Probe  ★ NEW
+# ================================================================
+def method_vless_probe(hostname, port, timeout):
+    """
+    Basic VLESS handshake probe.
+    VLESS v0 header: version(1) + UUID(16) + addon_len(1) + cmd(1) + port(2) + addr_type(1)
+    Server respond කළොත් VLESS capable.
+    """
+    import uuid, struct
+    try:
+        use_tls = port in [443,8443,2053,2083,2087,2096]
+        t0 = time.time()
+
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+            raw  = socket.create_connection((hostname,port),timeout=timeout)
+            sock = ctx.wrap_socket(raw, server_hostname=hostname)
+        else:
+            sock = socket.create_connection((hostname,port),timeout=timeout)
+
+        # VLESS request header (version 0)
+        uid   = uuid.uuid4().bytes   # 16 bytes random UUID
+        # cmd=1 (TCP), port=443, addr_type=2 (domain), addr=google.com
+        target_host = b"google.com"
+        payload = (
+            b'\x00'             # version
+            + uid               # UUID
+            + b'\x00'           # addon length = 0
+            + b'\x01'           # cmd TCP
+            + struct.pack('>H', 443)  # target port
+            + b'\x02'           # addr type: domain
+            + bytes([len(target_host)])
+            + target_host
+        )
+        sock.sendall(payload)
+        sock.settimeout(min(timeout, 3))
+
+        resp = b""
+        try:
+            resp = sock.recv(256)
+        except: pass
+        sock.close()
+        lat = int((time.time()-t0)*1000)
+
+        # VLESS response: version(1) + addon_len(1)
+        if len(resp) >= 2 and resp[0] == 0x00:
+            return {"works":True,"latency":lat,"response_len":len(resp)}
+        # Connection accept කළත් VLESS response නැත්නම් partial
+        elif resp:
+            return {"works":False,"partial":True,"latency":lat}
+    except: pass
+    return {"works":False}
+
+# ================================================================
+#  SNI Method 7: HTTP CONNECT
+# ================================================================
+def method_http_connect(hostname, port, timeout):
+    try:
+        t0 = time.time()
+        s  = socket.create_connection((hostname,port),timeout=timeout)
+        s.sendall(f"CONNECT {hostname}:443 HTTP/1.1\r\nHost: {hostname}\r\n\r\n".encode())
+        resp = s.recv(256).decode(errors='ignore')
+        s.close()
+        if "200" in resp:
+            return {"works":True,"latency":int((time.time()-t0)*1000)}
+    except: pass
+    return {"works":False}
+
+# ================================================================
+#  ECH (Encrypted Client Hello) Detection  ★ NEW
+# ================================================================
+def check_ech(hostname, timeout=5):
+    """
+    DNS HTTPS (type 65) / SVCB record lookup හරහා
+    ECH public key ඇත්දැයි detect කරනවා.
+    """
+    result = {"supported":False,"ech_key":None,"alpn":[],"ipv4hint":[]}
+
+    # Method A: dnspython
+    if dns:
+        try:
+            import dns.resolver, dns.rdatatype
+            ans = dns.resolver.resolve(hostname, 'HTTPS', lifetime=timeout)
+            for rdata in ans:
+                rdata_str = str(rdata)
+                if 'ech=' in rdata_str.lower():
+                    result["supported"] = True
+                    # Extract ECH key
+                    m = re.search(r'ech=([A-Za-z0-9+/=]+)', rdata_str, re.I)
+                    if m: result["ech_key"] = m.group(1)[:40]+"..."
+                if 'alpn=' in rdata_str.lower():
+                    m = re.search(r'alpn="([^"]+)"', rdata_str)
+                    if m: result["alpn"] = m.group(1).split(',')
+            return result
+        except: pass
+
+    # Method B: raw DNS query (type 65 HTTPS)
+    try:
+        import struct
+        # Build DNS query for HTTPS record (type 65)
+        def build_query(name):
+            qid  = os.urandom(2)
+            flags= b'\x01\x00'  # RD set
+            qdcount = b'\x00\x01'
+            ancount = arcount = nscount = b'\x00\x00'
+            header = qid + flags + qdcount + ancount + nscount + arcount
+            # Encode domain
+            parts  = name.split('.')
+            qname  = b''
+            for p in parts:
+                qname += bytes([len(p)]) + p.encode()
+            qname += b'\x00'
+            qtype  = b'\x00\x41'   # HTTPS = 65
+            qclass = b'\x00\x01'   # IN
+            return header + qname + qtype + qclass
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        sock.sendto(build_query(hostname), ("8.8.8.8", 53))
+        data, _ = sock.recvfrom(4096)
+        sock.close()
+        # Simple ECH key check in response
+        if b'ech' in data.lower():
+            result["supported"] = True
+    except: pass
+
+    return result
+
+# ================================================================
+#  HTTP/2 + HTTP/3 Check
+# ================================================================
+def check_http2_httpx(hostname, timeout=5):
+    """httpx HTTP/2 — accurate ALPN-based check"""
+    if httpx:
+        try:
+            with httpx.Client(http2=True, verify=False,
+                              timeout=timeout, follow_redirects=True) as cl:
+                r = cl.get(f"https://{hostname}")
+                return r.status_code, r.http_version == "HTTP/2"
+        except: pass
+
+    # Fallback: ALPN via ssl
+    try:
+        ctx = ssl.create_default_context()
+        ctx.set_alpn_protocols(['h2','http/1.1'])
+        ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((hostname,443),timeout=timeout) as s:
+            with ctx.wrap_socket(s, server_hostname=hostname) as ss:
+                is_h2 = ss.selected_alpn_protocol() == 'h2'
+                return None, is_h2
+    except: pass
+    return None, False
+
+def check_http3_quic(hostname, timeout=3):
+    """
+    HTTP/3 (QUIC) support — Alt-Svc header check.
+    Full QUIC handshake requires aioquic library.
+    """
+    result = {"supported": False, "alt_svc": None}
+    try:
+        sess, _ = get_session({"tls_fingerprint":"chrome120","user_agents":DEFAULT_CFG["user_agents"]})
+        if sess:
+            r = sess.get(f"https://{hostname}", timeout=timeout, verify=False)
+            alt = r.headers.get("alt-svc","")
+            if "h3" in alt or "quic" in alt.lower():
+                result["supported"] = True
+                result["alt_svc"]   = alt[:80]
+    except: pass
+    return result
+
+# ================================================================
+#  Full Method Detection (per host)
+# ================================================================
+def detect_all_methods(hostname, open_ports, timeout, bug_sni, cfg):
+    methods = {}
+    has_443 = 443 in open_ports
+    has_80  = 80  in open_ports
+    tls_port = next((p for p in [443,8443,2053,2083,2087,2096] if p in open_ports), None)
+    tcp_port = next((p for p in [80,8080] if p in open_ports), None)
+    any_port = next(iter(open_ports), None)
+
+    # 1. Direct SNI
+    methods["direct_sni"] = method_direct_sni(hostname, 443, timeout) \
+        if has_443 else method_direct_sni(hostname, tls_port, timeout) \
+        if tls_port else {"works":False}
+
+    # 2. SNI Mismatch (auto or manual)
+    if tls_port:
+        if bug_sni == "auto":
+            found = auto_detect_sni_mismatch(hostname, tls_port, timeout)
+            if found:
+                best = min(found, key=lambda x: x["latency"])
+                methods["sni_mismatch"] = {
+                    "works":True,"tls":best["tls"],"cn":best["cn"],
+                    "latency":best["latency"],"sni_used":best["sni"],
+                    "all_working":found,
+                }
+            else:
+                methods["sni_mismatch"] = {"works":False}
+        else:
+            r = method_sni_mismatch(hostname, bug_sni, tls_port, timeout)
+            if r.get("works"): r["sni_used"] = bug_sni
+            methods["sni_mismatch"] = r
+    else:
+        methods["sni_mismatch"] = {"works":False}
+
+    # 3. Empty SNI
+    methods["sni_empty"] = method_sni_empty(hostname, tls_port, timeout) \
+        if tls_port else {"works":False}
+
+    # 4. WebSocket Real Payload ★
+    if cfg.get("check_ws_payload",True) and any_port:
+        sni_host = methods["sni_mismatch"].get("sni_used") \
+            if methods["sni_mismatch"].get("works") else None
+        ws_port  = next((p for p in [80,8080,443,8443] if p in open_ports), None)
+        if ws_port:
+            methods["ws_real_payload"] = method_ws_real_payload(
+                hostname, ws_port, timeout, sni_host)
+        else:
+            methods["ws_real_payload"] = {"works":False}
+    else:
+        methods["ws_real_payload"] = {"works":False}
+
+    # 5. Domain Fronting ★
+    if cfg.get("check_fronting",True) and tls_port:
+        cdn = detect_cdn_advanced({})  # placeholder — actual cdn passed from caller
+        methods["domain_fronting"] = auto_domain_fronting(hostname, cdn, tls_port, timeout)
+    else:
+        methods["domain_fronting"] = {"works":False}
+
+    # 6. HTTP CONNECT
+    cp = tcp_port or (443 if has_443 else None)
+    methods["http_connect"] = method_http_connect(hostname, cp, timeout) \
+        if cp else {"works":False}
+
+    # 7. Host Header Inject
+    if has_80:
+        front = methods["sni_mismatch"].get("sni_used","free.facebook.com")
+        try:
+            t0 = time.time()
+            s  = socket.create_connection((hostname,80),timeout=timeout)
+            s.sendall(f"GET / HTTP/1.1\r\nHost: {front}\r\nConnection: close\r\n\r\n".encode())
+            resp = s.recv(512).decode(errors='ignore')
+            s.close()
+            parts= resp.split('\r\n')[0].split(' ') if resp else []
+            code = parts[1] if len(parts)>1 else ''
+            methods["host_header_inject"] = {
+                "works": code in ['200','301','302','307','308'],
+                "code":  code,
+                "latency": int((time.time()-t0)*1000),
+            }
         except:
-            pass
-    return DEFAULT_CONFIG.copy()
+            methods["host_header_inject"] = {"works":False}
+    else:
+        methods["host_header_inject"] = {"works":False}
 
-def save_config(cfg):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(cfg, f, indent=2)
-    print(G + f"[+] Config saved → {CONFIG_FILE}" + W)
+    # 8. VLESS Probe ★
+    if tls_port:
+        methods["vless_probe"] = method_vless_probe(hostname, tls_port, timeout)
+    else:
+        methods["vless_probe"] = {"works":False}
 
-# ── CDN Signatures ────────────────────────────────────────────────
-CDN_SIGNATURES = {
-    "Cloudflare":     ["cloudflare", "cf-ray", "cf-cache-status"],
-    "Akamai":         ["akamai", "x-check-cacheable", "x-akamai"],
-    "Fastly":         ["fastly", "x-fastly", "x-served-by"],
-    "AWS CloudFront": ["cloudfront", "x-amz-cf-id", "x-amz-cf-pop"],
-    "Google CDN":     ["gws", "x-google", "x-goog"],
-    "Azure CDN":      ["x-azure", "x-msedge-ref"],
-    "Sucuri":         ["sucuri", "x-sucuri-id"],
-    "Varnish":        ["varnish", "x-varnish"],
-    "Nginx":          ["nginx"],
-    "Apache":         ["apache"],
-    "LiteSpeed":      ["litespeed"],
-}
-
-METHOD_LABELS = {
-    "direct_sni":         "Direct-SNI",
-    "sni_mismatch":       "SNI-Mismatch",
-    "sni_empty":          "Empty-SNI",
-    "http_upgrade":       "WS-Upgrade",
-    "http_connect":       "CONNECT",
-    "host_header_inject": "HostInject",
-}
-
-# ── SNI Mismatch Candidates ──────────────────────────────────────
-# Zero-rated / free-access hostnames — auto mismatch test
-SNI_CANDIDATES = [
-    # Facebook free/zero
-    "free.facebook.com", "zero.facebook.com",
-    "m.facebook.com",    "web.facebook.com",
-    # WhatsApp
-    "media.whatsapp.com", "static.whatsapp.net",
-    "mmg.whatsapp.net",
-    # Google
-    "www.google.com", "googleapis.com", "gstatic.com",
-    # Opera Mini
-    "wap.opera.mini.net", "compress.opera-mini.net",
-    # Wikipedia zero
-    "en.m.wikipedia.org", "www.wikipedia.org",
-    # Twitter / X
-    "twitter.com", "mobile.twitter.com",
-    # Speedtest / neutral
-    "www.speedtest.net", "fast.com",
-    # CDN
-    "cloudflare.com", "cdn.cloudflare.com",
-    # Social
-    "www.youtube.com", "www.instagram.com",
-    "t.me", "telegram.org",
-]
+    return methods
 
 # ================================================================
-#  UI Helpers
+#  Adaptive Timeout
 # ================================================================
-def clear():
-    os.system('cls' if os.name == 'nt' else 'clear')
-
-def banner():
-    clear()
-    print(f"""
-{C}╔══════════════════════════════════════════════════════════╗
-║  {G}{BOLD}SNI BUG HOST FINDER{C} v3.0                               ║
-║  {DIM}Multi-Thread | SNI Methods | Port Scan | CDN Detect{C}     ║
-╚══════════════════════════════════════════════════════════╝{W}
-{Y}  [!] Educational & Research use only{W}
-""")
-
-def progress_bar(done, total, label=""):
-    if total == 0: return
-    pct  = done / total
-    fill = int(40 * pct)
-    bar  = G + "█" * fill + DIM + "░" * (40 - fill) + W
-    with print_lock:
-        sys.stdout.write(f"\r  {C}{label}{W} [{bar}] {Y}{done}/{total}{W}  ")
-        sys.stdout.flush()
-
-def score_color(s):
-    if s >= 70: return G + BOLD
-    if s >= 40: return Y
-    return R
-
-def get_ua(cfg):
-    import random
-    return random.choice(cfg.get("user_agents", DEFAULT_CONFIG["user_agents"]))
+def adaptive_timeout(base, lat_ms):
+    if lat_ms is None:   return base
+    if lat_ms < 100:     return max(2, base-1)
+    if lat_ms < 400:     return base
+    return min(base+2, 10)
 
 # ================================================================
-#  Subdomain Discovery  (3 sources)
+#  Subdomain Discovery
 # ================================================================
+import urllib.request, urllib.parse
+
+def _fetch(url, timeout=12):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent":"SNI-BugFinder/4.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode(errors='ignore')
+    except: return ""
+
 def subs_hackertarget(domain, timeout):
     out = set()
-    try:
-        r = requests.get(f"https://api.hackertarget.com/hostsearch/?q={domain}",
-                         timeout=timeout)
-        if r.status_code == 200 and "error" not in r.text.lower():
-            for line in r.text.strip().split('\n'):
-                if ',' in line:
-                    s = line.split(',')[0].strip()
-                    if s: out.add(s)
-    except: pass
+    txt = _fetch(f"https://api.hackertarget.com/hostsearch/?q={domain}", timeout)
+    for line in txt.strip().split('\n'):
+        if ',' in line:
+            s = line.split(',')[0].strip()
+            if s: out.add(s)
     return out
 
 def subs_crtsh(domain, timeout):
     out = set()
+    txt = _fetch(f"https://crt.sh/?q=%.{domain}&output=json", timeout+5)
     try:
-        r = requests.get(f"https://crt.sh/?q=%.{domain}&output=json",
-                         timeout=timeout + 5,
-                         headers={"User-Agent": "SNI-BugFinder/3.0"})
-        if r.status_code == 200:
-            for entry in r.json():
-                for name in entry.get('name_value', '').split('\n'):
-                    name = name.strip().lstrip('*.')
-                    if name and domain in name:
-                        out.add(name)
+        for e in json.loads(txt):
+            for n in e.get('name_value','').split('\n'):
+                n = n.strip().lstrip('*.')
+                if n and domain in n: out.add(n)
     except: pass
     return out
 
 def subs_alienvault(domain, timeout):
     out = set()
+    txt = _fetch(
+        f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns",timeout)
     try:
-        r = requests.get(
-            f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns",
-            timeout=timeout,
-            headers={"User-Agent": "SNI-BugFinder/3.0"})
-        if r.status_code == 200:
-            for rec in r.json().get('passive_dns', []):
-                h = rec.get('hostname', '')
-                if h and domain in h:
-                    out.add(h)
+        for rec in json.loads(txt).get('passive_dns',[]):
+            h = rec.get('hostname','')
+            if h and domain in h: out.add(h)
     except: pass
     return out
 
 def collect_subdomains(domain, cfg):
     all_subs = set()
     timeout  = cfg["timeout"]
-    print(C + "\n  [*] Subdomain Sources:\n" + W)
+    print(C+"\n  [*] Subdomain Sources:\n"+W)
 
-    print(C + "    → HackerTarget     ..." + W, end='', flush=True)
+    print(C+"    → HackerTarget     ..."+W, end='', flush=True)
     ht = subs_hackertarget(domain, timeout)
-    all_subs |= ht
-    print(G + f" {len(ht)} found" + W)
+    all_subs |= ht; print(G+f" {len(ht)} found"+W)
 
     if cfg["use_crtsh"]:
-        print(C + "    → CRT.sh (SSL)     ..." + W, end='', flush=True)
+        print(C+"    → CRT.sh (SSL)     ..."+W, end='', flush=True)
         crt = subs_crtsh(domain, timeout)
-        all_subs |= crt
-        print(G + f" {len(crt)} found" + W)
+        all_subs |= crt; print(G+f" {len(crt)} found"+W)
 
     if cfg["use_alienvault"]:
-        print(C + "    → AlienVault OTX   ..." + W, end='', flush=True)
+        print(C+"    → AlienVault OTX   ..."+W, end='', flush=True)
         av = subs_alienvault(domain, timeout)
-        all_subs |= av
-        print(G + f" {len(av)} found" + W)
+        all_subs |= av; print(G+f" {len(av)} found"+W)
 
     return sorted(all_subs)
 
 # ================================================================
-#  Port Scanner
+#  Main Host Scanner
 # ================================================================
-def scan_ports(hostname, ports, timeout):
-    open_ports = {}
-    for port in ports:
-        try:
-            t0   = time.time()
-            sock = socket.create_connection((hostname, port), timeout=timeout)
-            latency_ms = int((time.time() - t0) * 1000)
-            sock.close()
-            open_ports[port] = latency_ms
-        except: pass
-    return open_ports
-
-# ================================================================
-#  SNI / SSL Method Checks
-# ================================================================
-def method_direct_sni(hostname, port, timeout):
-    """Normal TLS — hostname ලෙසම SNI set"""
-    try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_OPTIONAL
-        t0 = time.time()
-        with socket.create_connection((hostname, port), timeout=timeout) as s:
-            with ctx.wrap_socket(s, server_hostname=hostname) as ss:
-                lat  = int((time.time() - t0) * 1000)
-                cert = ss.getpeercert() or {}
-                subj = dict(x[0] for x in cert.get('subject', []))
-                san  = [v for t, v in cert.get('subjectAltName', []) if t == 'DNS']
-                cip  = ss.cipher()
-                return {
-                    "works":   True,
-                    "tls":     ss.version(),
-                    "cn":      subj.get('commonName', '?'),
-                    "san":     san[:4],
-                    "expiry":  cert.get('notAfter', '?'),
-                    "cipher":  cip[0] if cip else '?',
-                    "bits":    cip[2] if cip and len(cip) > 2 else '?',
-                    "latency": lat,
-                }
-    except: pass
-    return {"works": False}
-
-def method_sni_mismatch(real_host, sni_host, port, timeout):
-    """
-    SNI Mismatch — real_host ට TCP connect වෙලා
-    TLS SNI field එකේ sni_host දානවා.
-    Bug hosting core method — certificate mismatch ලෙස verify නොකර
-    server respond කරනවා නම් bug host!
-    """
-    try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_NONE   # mismatch allow
-        t0 = time.time()
-        with socket.create_connection((real_host, port), timeout=timeout) as s:
-            with ctx.wrap_socket(s, server_hostname=sni_host) as ss:
-                lat  = int((time.time() - t0) * 1000)
-                cert = ss.getpeercert(binary_form=False) or {}
-                subj = dict(x[0] for x in cert.get('subject', [])) if cert else {}
-                return {
-                    "works":   True,
-                    "tls":     ss.version(),
-                    "cn":      subj.get('commonName', '?'),
-                    "latency": lat,
-                }
-    except: pass
-    return {"works": False}
-
-def method_sni_empty(hostname, port, timeout):
-    """Empty SNI — SNI field නැතිව TLS handshake"""
-    try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_NONE
-        t0 = time.time()
-        with socket.create_connection((hostname, port), timeout=timeout) as s:
-            # server_hostname=None → SNI extension send නොකරයි
-            with ctx.wrap_socket(s, server_hostname=None) as ss:
-                lat = int((time.time() - t0) * 1000)
-                return {"works": True, "tls": ss.version(), "latency": lat}
-    except: pass
-    return {"works": False}
-
-def method_http_upgrade(hostname, port, timeout):
-    """HTTP → WebSocket Upgrade — 101 response check"""
-    try:
-        t0 = time.time()
-        s  = socket.create_connection((hostname, port), timeout=timeout)
-        req = (
-            f"GET / HTTP/1.1\r\n"
-            f"Host: {hostname}\r\n"
-            f"Upgrade: websocket\r\n"
-            f"Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-            f"Sec-WebSocket-Version: 13\r\n\r\n"
-        )
-        s.sendall(req.encode())
-        resp    = s.recv(512).decode(errors='ignore')
-        latency = int((time.time() - t0) * 1000)
-        s.close()
-        code = resp.split(' ')[1] if len(resp.split(' ')) > 1 else ''
-        if code in ['101', '200']:
-            return {"works": True, "code": code, "latency": latency}
-    except: pass
-    return {"works": False}
-
-def method_http_connect(hostname, port, timeout):
-    """HTTP CONNECT tunnel probe — proxy capability check"""
-    try:
-        t0  = time.time()
-        s   = socket.create_connection((hostname, port), timeout=timeout)
-        req = f"CONNECT {hostname}:443 HTTP/1.1\r\nHost: {hostname}\r\n\r\n"
-        s.sendall(req.encode())
-        resp    = s.recv(256).decode(errors='ignore')
-        latency = int((time.time() - t0) * 1000)
-        s.close()
-        if "200" in resp:
-            return {"works": True, "latency": latency}
-    except: pass
-    return {"works": False}
-
-def method_host_inject(real_host, port, fake_host, timeout):
-    """Host Header Injection — actual server ට fake Host: header"""
-    try:
-        t0  = time.time()
-        s   = socket.create_connection((real_host, port), timeout=timeout)
-        req = (
-            f"GET / HTTP/1.1\r\n"
-            f"Host: {fake_host}\r\n"
-            f"Connection: close\r\n\r\n"
-        )
-        s.sendall(req.encode())
-        resp    = s.recv(512).decode(errors='ignore')
-        latency = int((time.time() - t0) * 1000)
-        s.close()
-        parts = resp.split('\r\n')[0].split(' ') if resp else []
-        code  = parts[1] if len(parts) > 1 else ''
-        if code in ['200', '301', '302', '307', '308']:
-            return {"works": True, "code": code, "latency": latency}
-    except: pass
-    return {"works": False}
-
-def check_http2(hostname, timeout):
-    """ALPN negotiation — HTTP/2 support check"""
-    try:
-        ctx = ssl.create_default_context()
-        ctx.set_alpn_protocols(['h2', 'http/1.1'])
-        ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_NONE
-        with socket.create_connection((hostname, 443), timeout=timeout) as s:
-            with ctx.wrap_socket(s, server_hostname=hostname) as ss:
-                return ss.selected_alpn_protocol() == 'h2'
-    except: pass
-    return False
-
-# ================================================================
-#  All SNI Methods in one call
-# ================================================================
-#  SNI Mismatch Auto-Detector
-# ================================================================
-def auto_detect_sni_mismatch(hostname, port, timeout):
-    """
-    SNI_CANDIDATES list එකේ ඔක්කොම try කරලා
-    respond කරන ඒවා list කරනවා.
-    Returns: [ {sni, tls, cn, latency}, ... ]
-    """
-    working = []
-    for candidate in SNI_CANDIDATES:
-        try:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode    = ssl.CERT_NONE
-            t0 = time.time()
-            with socket.create_connection((hostname, port), timeout=timeout) as s:
-                with ctx.wrap_socket(s, server_hostname=candidate) as ss:
-                    lat  = int((time.time() - t0) * 1000)
-                    cert = ss.getpeercert(binary_form=False) or {}
-                    subj = dict(x[0] for x in cert.get('subject', [])) if cert else {}
-                    working.append({
-                        "sni":     candidate,
-                        "tls":     ss.version(),
-                        "cn":      subj.get('commonName', '?'),
-                        "latency": lat,
-                    })
-        except: pass
-    return working
-
-# ================================================================
-def detect_all_methods(hostname, open_ports, timeout, bug_sni):
-    methods = {}
-    has_443 = 443 in open_ports
-    has_80  = 80  in open_ports
-
-    # 1. Direct SNI
-    methods["direct_sni"] = method_direct_sni(hostname, 443, timeout) \
-        if has_443 else {"works": False}
-
-    # 2. SNI Mismatch ← Bug hosting core method
-    #    bug_sni="auto" නම් candidates ඔක්කොම try කරනවා
-    if has_443:
-        if bug_sni == "auto":
-            found = auto_detect_sni_mismatch(hostname, 443, timeout)
-            if found:
-                # best (lowest latency) candidate pick කරනවා
-                best = min(found, key=lambda x: x["latency"])
-                methods["sni_mismatch"] = {
-                    "works":      True,
-                    "tls":        best["tls"],
-                    "cn":         best["cn"],
-                    "latency":    best["latency"],
-                    "sni_used":   best["sni"],
-                    "all_working": found,   # ඔක්කොම working candidates
-                }
-            else:
-                methods["sni_mismatch"] = {"works": False}
-        else:
-            r = method_sni_mismatch(hostname, bug_sni, 443, timeout)
-            if r.get("works"):
-                r["sni_used"] = bug_sni
-            methods["sni_mismatch"] = r
-    else:
-        methods["sni_mismatch"] = {"works": False}
-
-    # 3. Empty SNI
-    methods["sni_empty"] = method_sni_empty(hostname, 443, timeout) \
-        if has_443 else {"works": False}
-
-    # 4. WebSocket Upgrade
-    ws_port = next((p for p in [80, 8080, 443, 8443] if p in open_ports), None)
-    methods["http_upgrade"] = method_http_upgrade(hostname, ws_port, timeout) \
-        if ws_port else {"works": False}
-
-    # 5. HTTP CONNECT
-    con_port = 80 if has_80 else (443 if has_443 else None)
-    methods["http_connect"] = method_http_connect(hostname, con_port, timeout) \
-        if con_port else {"works": False}
-
-    # 6. Host Header Injection
-    methods["host_header_inject"] = method_host_inject(hostname, 80, bug_sni, timeout) \
-        if has_80 else {"works": False}
-
-    return methods
-
-# ================================================================
-#  CDN Detector
-# ================================================================
-def detect_cdn(headers):
-    s = json.dumps(dict(headers)).lower()
-    return list({name for name, sigs in CDN_SIGNATURES.items()
-                 if any(sig in s for sig in sigs)})
-
-# ================================================================
-#  Full Host Scanner
-# ================================================================
-def scan_host(hostname, cfg, bug_sni, pre_resolved_ip=None):
+def scan_host(hostname, cfg, bug_sni, pre_ip=None):
     result = {
-        "host":             hostname,
-        "ip":               pre_resolved_ip,
-        "http_status":      None,
-        "https_status":     None,
-        "server":           None,
-        "cdn":              [],
-        "open_ports":       {},
-        "http2":            False,
-        "sni_methods":      {},
-        "working_methods":  [],
-        "bug_score":        0,
-        "is_bug_host":      False,
-        "redirect_to":      None,
-        "latency_ms":       None,
-        "retry":            False,
+        "host":            hostname,
+        "ip":              pre_ip,
+        "http_status":     None,
+        "https_status":    None,
+        "h2_status":       None,
+        "server":          None,
+        "cdn":             [],
+        "open_ports":      {},
+        "http2":           False,
+        "http3":           {},
+        "ech":             {},
+        "sni_methods":     {},
+        "working_methods": [],
+        "bug_score":       0,
+        "is_bug_host":     False,
+        "redirect_to":     None,
+        "latency_ms":      None,
+        "tls_fingerprint": cfg.get("tls_fingerprint","requests"),
     }
-    timeout = cfg["timeout"]
-    sess    = get_session(cfg)
+    timeout  = cfg["timeout"]
+    sess, is_cffi = get_session(cfg)
 
-    # IP resolve (cache miss ems)
+    # IP
     if not result["ip"]:
-        try:
-            result["ip"] = socket.gethostbyname(hostname)
+        try: result["ip"] = socket.gethostbyname(hostname)
         except: pass
 
     # Port scan
-    result["open_ports"] = scan_ports(hostname, cfg["ports"], timeout) \
-        if cfg["check_ports"] else {80: 0, 443: 0}
+    if cfg["check_ports"]:
+        result["open_ports"] = {}
+        for p in cfg["ports"]:
+            try:
+                t0   = time.time()
+                sock = socket.create_connection((hostname,p),timeout=min(timeout,3))
+                lat  = int((time.time()-t0)*1000)
+                sock.close()
+                result["open_ports"][p] = lat
+            except: pass
+    else:
+        result["open_ports"] = {80:0,443:0}
+
     op = result["open_ports"]
 
-    # HTTP  (connection pool reuse)
+    # HTTP (via curl_cffi or requests)
+    def _get(url, to):
+        if sess:
+            if is_cffi:
+                return sess.get(url, timeout=to, allow_redirects=True,
+                                verify=False)
+            else:
+                return sess.get(url, timeout=to, allow_redirects=True,
+                                verify=False)
+        return None
+
     if 80 in op or not cfg["check_ports"]:
         try:
             t0 = time.time()
-            r  = sess.get(f"http://{hostname}", timeout=timeout,
-                          allow_redirects=True, verify=False)
-            result["http_status"] = r.status_code
-            result["latency_ms"]  = int((time.time() - t0) * 1000)
-            result["server"]      = r.headers.get('Server', '')
-            result["cdn"]         = detect_cdn(r.headers)
-            if r.history:
-                result["redirect_to"] = r.url
+            r  = _get(f"http://{hostname}", timeout)
+            if r:
+                result["http_status"] = r.status_code
+                result["latency_ms"]  = int((time.time()-t0)*1000)
+                result["server"]      = r.headers.get('Server','') or r.headers.get('server','')
+                ck = r.headers.get('Set-Cookie','')
+                result["cdn"]         = detect_cdn_advanced(dict(r.headers), ck, result["ip"] or "")
+                if hasattr(r,'history') and r.history:
+                    result["redirect_to"] = r.url
         except: pass
 
-    # Adaptive timeout after first latency measure
+    # Adaptive timeout after HTTP latency
     timeout = adaptive_timeout(timeout, result["latency_ms"])
 
-    # HTTPS
     if cfg["check_https"] and (443 in op or not cfg["check_ports"]):
         try:
-            r2 = sess.get(f"https://{hostname}", timeout=timeout,
-                          allow_redirects=True, verify=False)
-            result["https_status"] = r2.status_code
-            if not result["server"]:
-                result["server"] = r2.headers.get('Server', '')
-            result["cdn"] = list(set(result["cdn"] + detect_cdn(r2.headers)))
+            r2 = _get(f"https://{hostname}", timeout)
+            if r2:
+                result["https_status"] = r2.status_code
+                if not result["server"]:
+                    result["server"] = r2.headers.get('Server','')
+                ck2 = r2.headers.get('Set-Cookie','')
+                result["cdn"] = list(set(result["cdn"]
+                    + detect_cdn_advanced(dict(r2.headers), ck2, result["ip"] or "")))
         except: pass
 
-    # HTTP/2
+    # HTTP/2 via httpx
     if cfg.get("check_http2") and 443 in op:
-        result["http2"] = check_http2(hostname, timeout)
+        h2_code, is_h2 = check_http2_httpx(hostname, timeout)
+        result["http2"]      = is_h2
+        result["h2_status"]  = h2_code
 
-    # SNI methods
+    # HTTP/3 Alt-Svc check
+    if cfg.get("check_http3") and 443 in op:
+        result["http3"] = check_http3_quic(hostname, timeout)
+
+    # ECH check
+    if cfg.get("check_ech"):
+        result["ech"] = check_ech(hostname, timeout)
+
+    # All SNI methods
     if cfg["check_sni"]:
-        result["sni_methods"]     = detect_all_methods(hostname, op, timeout, bug_sni)
-        result["working_methods"] = [m for m, v in result["sni_methods"].items()
+        result["sni_methods"]     = detect_all_methods(hostname, op, timeout, bug_sni, cfg)
+        result["working_methods"] = [m for m,v in result["sni_methods"].items()
                                      if v.get("works")]
 
-    # Bug Score
-    s  = 0
-    m  = result["sni_methods"]
-    if result["http_status"]  == 200: s += 15
-    if result["https_status"] == 200: s += 15
-    if m.get("direct_sni",         {}).get("works"): s += 15
-    if m.get("sni_mismatch",       {}).get("works"): s += 30  # ← highest weight
-    if m.get("sni_empty",          {}).get("works"): s += 10
-    if m.get("http_upgrade",       {}).get("works"): s += 15
-    if m.get("http_connect",       {}).get("works"): s += 10
-    if m.get("host_header_inject", {}).get("works"): s += 10
-    if result["http2"]:                              s += 5
-    if any(c in result["cdn"] for c in ["Cloudflare","Akamai","Fastly"]): s += 5
+    # Bug Score ──────────────────────────────────────────────────
+    s = 0
+    m = result["sni_methods"]
+    if result["http_status"]  == 200:  s += 10
+    if result["https_status"] == 200:  s += 10
+    if result["http2"]:                s += 5
+    if result["http3"].get("supported"):s += 3
+    if result["ech"].get("supported"): s += 5
+    if m.get("direct_sni",        {}).get("works"): s += 12
+    if m.get("sni_mismatch",      {}).get("works"): s += 30  # highest
+    if m.get("sni_empty",         {}).get("works"): s += 8
+    if m.get("ws_real_payload",   {}).get("works"): s += 20  # real payload
+    if m.get("domain_fronting",   {}).get("works"): s += 20  # domain fronting
+    if m.get("http_connect",      {}).get("works"): s += 8
+    if m.get("host_header_inject",{}).get("works"): s += 8
+    if m.get("vless_probe",       {}).get("works"): s += 15  # VLESS
+    if any(c in result["cdn"] for c in ["Cloudflare","Akamai","Fastly","AWS CloudFront"]): s += 4
 
     result["bug_score"]   = min(s, 100)
     result["is_bug_host"] = result["bug_score"] >= 50
     return result
 
 # ================================================================
-#  Multi-threaded Runner
+#  Progress + Milestone
 # ================================================================
-def run_scan(subdomains, cfg, bug_sni, domain=""):
-    total    = len(subdomains)
+def progress_bar(done, total, label="", eta=""):
+    if total == 0: return
+    f   = int(40 * done / total)
+    bar = G + "█"*f + DIM + "░"*(40-f) + W
+    with plock:
+        sys.stdout.write(f"\r  {C}{label}{W} [{bar}] {Y}{done}/{total}{W} {DIM}{eta}{W}  ")
+        sys.stdout.flush()
+
+def milestone_table(results, pct, total):
+    bugs = [r for r in results if r["is_bug_host"]]
+    sp(C + f"\n\n  ── {pct}% ({len(results)}/{total}) │ Bug hosts: {len(bugs)} ──" + W)
+    for r in sorted(bugs, key=lambda x: x["bug_score"], reverse=True)[:5]:
+        sc = G if r['bug_score'] >= 70 else Y
+        ms = ' '.join(METHOD_LABELS.get(m,m) for m in r.get('working_methods',[]))
+        sp(G + f"  ★ {r['host']:<42}" + sc + f" {r['bug_score']}%" + W
+           + C + f"  [{ms}]" + W)
+
+# ================================================================
+#  Async Scan Runner
+# ================================================================
+async def _async_runner(subdomains, cfg, bug_sni, ip_cache):
+    """
+    asyncio event loop ඇතුලේ:
+    1. Async DNS resolve
+    2. Wildcard detect
+    3. Sync scan_host thread pool ලෙස run
+    """
+    sem      = asyncio.Semaphore(cfg.get("async_concurrency", 200))
     results  = []
-    counter  = {"n": 0, "errors": 0}
-    milestones_hit = set()
+    r_lock   = asyncio.Lock()
+    counter  = {"n": 0}
+    total    = len(subdomains)
     t_start  = time.time()
+    milestones_hit = set()
 
-    print(C + f"\n  Threads:{cfg['threads']} | Timeout:{cfg['timeout']}s "
-              f"| Bug-SNI:{bug_sni} | Hosts:{total}" + W)
+    loop = asyncio.get_event_loop()
+    executor = ThreadPoolExecutor(max_workers=cfg["threads"])
 
-    # ── Step 1: DNS Pre-Resolve (parallel) ──────────────────────
-    print(C + "\n  [1/3] DNS pre-resolving..." + W, end='', flush=True)
-    ip_cache = parallel_dns_resolve(subdomains, threads=min(80, total+1))
-    resolved_count = len(ip_cache)
-    print(G + f" {resolved_count}/{total} resolved" + W)
+    async def worker(h):
+        async with sem:
+            pre_ip = ip_cache.get(h)
+            res = await loop.run_in_executor(
+                executor, scan_host, h, cfg, bug_sni, pre_ip)
+            async with r_lock:
+                results.append(res)
+                n = counter["n"] + 1
+                counter["n"] = n
+                elapsed = time.time() - t_start
+                speed   = n / elapsed if elapsed > 0 else 1
+                eta_s   = int((total-n)/speed) if speed > 0 else 0
+                eta_str = f"ETA:{eta_s}s"
+                progress_bar(n, total, "Scanning", eta_str)
+                pct = int(n / total * 100)
+                for mp in [25,50,75]:
+                    if pct >= mp and mp not in milestones_hit:
+                        milestones_hit.add(mp)
+                        milestone_table(results[:], mp, total)
 
-    # ── Step 2: Filter dead + wildcard ──────────────────────────
-    print(C + "  [2/3] Filtering dead & wildcard subdomains..." + W)
-    if domain:
-        subdomains, _ = filter_subdomains(subdomains, domain, ip_cache)
-    else:
-        subdomains = [h for h in subdomains if h in ip_cache]
+    await asyncio.gather(*[worker(h) for h in subdomains])
+    executor.shutdown(wait=False)
+    return results
+
+def run_scan(subdomains, cfg, bug_sni, domain=""):
     total = len(subdomains)
+    print(C + f"\n  Mode: {'curl_cffi TLS-Spoof' if curl_cffi else 'standard requests'}"
+              f" | HTTP2: {'httpx' if httpx else 'ssl-alpn'}"
+              f" | Async-concurrency: {cfg.get('async_concurrency',200)}" + W)
+    print(C + f"  Threads: {cfg['threads']} | Timeout: {cfg['timeout']}s"
+              f" | Bug-SNI: {bug_sni}" + W)
+
+    # Step 1: Async DNS resolve
+    print(C + "\n  [1/3] DNS pre-resolving (async)..." + W, end='', flush=True)
+    ip_cache = asyncio.run(async_batch_resolve(subdomains, concurrency=150))
+    print(G + f" {len(ip_cache)}/{total} resolved" + W)
+
+    # Step 2: Wildcard + filter
+    print(C + "  [2/3] Wildcard & dead host filter..." + W)
+    wildcard_ip = asyncio.run(detect_wildcard_async(domain)) if domain else None
+    if wildcard_ip:
+        print(Y + f"  [!] Wildcard *.{domain} = {wildcard_ip} — filter කරනවා" + W)
+    subdomains = filter_subdomains(subdomains, domain, ip_cache, wildcard_ip)
+    total      = len(subdomains)
     if not total:
-        print(R + "  [-] Usable subdomains නෑ!" + W)
-        return []
+        print(R + "  [-] Usable hosts නෑ!" + W); return []
 
-    print(C + f"  [3/3] Scanning {total} hosts...\n" + W)
-    print(C + "  " + "─" * 88 + W)
+    # Step 3: Async scan
+    print(C + f"  [3/3] Scanning {total} hosts (async + thread pool)...\n" + W)
+    print(C + "  " + "─"*90 + W)
 
-    # ── Step 3: Multi-thread scan ────────────────────────────────
-    def worker(h):
-        pre_ip = ip_cache.get(h)
-        res    = scan_host(h, cfg, bug_sni, pre_resolved_ip=pre_ip)
-        n = counter["n"] + 1
-        counter["n"] = n
-
-        # ETA calculation
-        elapsed = time.time() - t_start
-        speed   = n / elapsed if elapsed > 0 else 1
-        eta_s   = int((total - n) / speed) if speed > 0 else 0
-        eta_str = f"ETA:{eta_s}s" if eta_s < 9999 else ""
-        progress_bar(n, total, f"Scanning {eta_str}")
-
-        # Milestone tables at 25%, 50%, 75%
-        pct = int(n / total * 100)
-        for mp in [25, 50, 75]:
-            if pct >= mp and mp not in milestones_hit:
-                milestones_hit.add(mp)
-                milestone_table(results[:], mp, total)
-        return res
-
-    with ThreadPoolExecutor(max_workers=cfg["threads"]) as ex:
-        futs = {ex.submit(worker, s): s for s in subdomains}
-        for fut in as_completed(futs):
-            try:
-                r = fut.result()
-                # Retry once if no response at all
-                if not r["http_status"] and not r["https_status"] and not r["open_ports"]:
-                    r2 = scan_host(r["host"], cfg, bug_sni,
-                                   pre_resolved_ip=ip_cache.get(r["host"]))
-                    r2["retry"] = True
-                    results.append(r2)
-                else:
-                    results.append(r)
-            except:
-                counter["errors"] += 1
-
+    results = asyncio.run(_async_runner(subdomains, cfg, bug_sni, ip_cache))
     print()
 
-    # ── Dedup same-IP hosts ──────────────────────────────────────
-    before_dedup = len(results)
-    results = dedup_by_ip(results)
-    dedup_removed = before_dedup - len(results)
+    # Dedup same-IP
+    best_ip = {}
+    for r in results:
+        ip = r.get("ip")
+        if ip:
+            if ip not in best_ip or r["bug_score"] > best_ip[ip]["bug_score"]:
+                best_ip[ip] = r
+        else:
+            best_ip[id(r)] = r  # no IP — keep as-is
 
-    if dedup_removed:
-        print(Y + f"  [*] Duplicate IP filter: {dedup_removed} same-server hosts removed" + W)
+    removed = len(results) - len(best_ip)
+    if removed:
+        print(Y + f"  [*] Dedup: {removed} same-server hosts removed" + W)
 
-    results.sort(key=lambda x: x["bug_score"], reverse=True)
-    return results
+    results = sorted(best_ip.values(), key=lambda x: x["bug_score"], reverse=True)
+    return list(results)
+
+# ================================================================
+#  Score color helper
+# ================================================================
+def sc(n):
+    if n>=70: return G+BOLD
+    if n>=40: return Y
+    return R
 
 # ================================================================
 #  Results Display
 # ================================================================
 def display_results(results, domain):
-    bug_hosts    = [r for r in results if r["is_bug_host"]]
-    mismatches   = [r for r in results if r["sni_methods"].get("sni_mismatch",{}).get("works")]
+    bugs      = [r for r in results if r["is_bug_host"]]
+    mismatches= [r for r in results if r["sni_methods"].get("sni_mismatch",{}).get("works")]
+    ws_ok     = [r for r in results if r["sni_methods"].get("ws_real_payload",{}).get("works")]
+    front_ok  = [r for r in results if r["sni_methods"].get("domain_fronting",{}).get("works")]
+    vless_ok  = [r for r in results if r["sni_methods"].get("vless_probe",{}).get("works")]
+    ech_ok    = [r for r in results if r.get("ech",{}).get("supported")]
+    h2_ok     = [r for r in results if r["http2"]]
+    h3_ok     = [r for r in results if r.get("http3",{}).get("supported")]
+    tls_fp    = results[0].get("tls_fingerprint","?") if results else "?"
 
-    print(G + f"\n{'═'*70}" + W)
-    print(G + f"  SCAN COMPLETE — {domain}" + W)
-    print(C + f"  Total Scanned   : {len(results)}" + W)
-    print(G + f"  Bug Hosts       : {len(bug_hosts)}" + W)
-    print(M + f"  SNI Mismatch    : {len(mismatches)}" + W)
-    print(B + f"  HTTP/2 Hosts    : {len([r for r in results if r['http2']])}" + W)
-    print(G + f"{'═'*70}\n" + W)
+    print(G+f"\n{'═'*75}"+W)
+    print(G+f"  SCAN COMPLETE — {domain}"+W)
+    print(C+f"  TLS Fingerprint : {tls_fp} ({'curl_cffi' if curl_cffi else 'ssl fallback'})"+W)
+    print(C+f"  Total Scanned   : {len(results)}"+W)
+    print(G+f"  Bug Hosts       : {len(bugs)}"+W)
+    print(M+f"  SNI Mismatch    : {len(mismatches)}"+W)
+    print(G+f"  WS Real Payload : {len(ws_ok)}"+W)
+    print(Y+f"  Domain Fronting : {len(front_ok)}"+W)
+    print(B+f"  VLESS Probe     : {len(vless_ok)}"+W)
+    print(B+f"  HTTP/2          : {len(h2_ok)}"+W)
+    print(C+f"  HTTP/3 (QUIC)   : {len(h3_ok)}"+W)
+    print(M+f"  ECH Support     : {len(ech_ok)}"+W)
+    print(G+f"{'═'*75}\n"+W)
 
     # ── Table 1: Bug Hosts ───────────────────────────────────────
-    if bug_hosts:
-        print(G + BOLD + f"[★] BUG HOSTS  ({len(bug_hosts)} found)\n" + W)
-        print(C + f"  {'HOST':<40} {'IP':<16} {'HTTP':>4} {'HTTPS':>5} "
-                  f"{'H2':>3} {'CDN':<14} {'SCORE':>6}  WORKING METHODS" + W)
-        print(C + "  " + "─" * 110 + W)
-        for r in bug_hosts:
+    if bugs:
+        print(G+BOLD+f"[★] BUG HOSTS ({len(bugs)})\n"+W)
+        print(C+f"  {'HOST':<38} {'IP':<16} {'H'}>4 {'S'}>5 "
+                f"{'H2':>3} {'CDN':<14} {'SCORE':>6}  METHODS"+W)
+        print(C+"  "+"─"*112+W)
+        for r in bugs:
             ip      = r["ip"] or "?"
-            http_s  = str(r["http_status"])  if r["http_status"]  else "---"
-            https_s = str(r["https_status"]) if r["https_status"] else "---"
-            cdn     = ', '.join(r["cdn"][:2]) if r["cdn"] else "—"
+            hs      = str(r["http_status"])  if r["http_status"]  else "---"
+            ss      = str(r["https_status"]) if r["https_status"] else "---"
+            cdn     = ','.join(r["cdn"][:2]) if r["cdn"] else "—"
             h2      = G+"✔"+W if r["http2"] else DIM+"—"+W
-            sc      = score_color(r["bug_score"])
-            methods = " ".join(G + METHOD_LABELS.get(m, m) + W for m in r["working_methods"])
-            print(f"  {G}{r['host']:<40}{W} {DIM}{ip:<16}{W} "
-                  f"{http_s:>4} {https_s:>5} {h2:>3} "
-                  f"{M}{cdn:<14}{W} {sc}{r['bug_score']:>5}%{W}  {methods}")
-    else:
-        print(Y + "  [!] Bug Hosts හොයාගන්න බැරි වුනා." + W)
+            methods = " ".join(G+METHOD_LABELS.get(m,m)+W for m in r["working_methods"])
+            print(f"  {G}{r['host']:<38}{W} {DIM}{ip:<16}{W} "
+                  f"{hs:>4} {ss:>5} {h2:>3} "
+                  f"{M}{cdn:<14}{W} {sc(r['bug_score'])}{r['bug_score']:>5}%{W}  {methods}")
 
     # ── Table 2: SNI Mismatch Detail ─────────────────────────────
     if mismatches:
-        print(M + BOLD + f"\n[SNI-MISMATCH] Bug Contact Method Detail  ({len(mismatches)} hosts)\n" + W)
-        print(C + f"  {'HOST':<40} {'SNI USED':<28} {'TLS':>8} {'CN (Served)':<28} {'LATENCY':>9}" + W)
-        print(C + "  " + "─" * 120 + W)
+        print(M+BOLD+f"\n[SNI-MISMATCH] Detail ({len(mismatches)})\n"+W)
+        print(C+f"  {'HOST':<38} {'SNI USED':<28} {'TLS':>9} {'CN':<28} {'LAT':>7}"+W)
+        print(C+"  "+"─"*115+W)
         for r in mismatches:
-            mm      = r["sni_methods"]["sni_mismatch"]
-            tls     = mm.get("tls",      "?")
-            cn      = mm.get("cn",       "?") or "?"
-            lat     = f"{mm['latency']}ms" if mm.get("latency") else "?"
-            sni_used= mm.get("sni_used", "?")
-            print(M + f"  {r['host']:<40}{W} {G}{sni_used:<28}{W} {B}{tls:>8}{W} {cn:<28} {Y}{lat:>9}{W}")
-
-            # auto mode නම් ඔක්කොම working candidates show කරනවා
-            all_w = mm.get("all_working", [])
+            mm  = r["sni_methods"]["sni_mismatch"]
+            all_w = mm.get("all_working",[])
+            print(M+f"  {r['host']:<38}{W} {G}{mm.get('sni_used','?'):<28}{W} "
+                  f"{B}{mm.get('tls','?'):>9}{W} {mm.get('cn','?'):<28} "
+                  f"{Y}{mm.get('latency','?')}ms{W}")
             if len(all_w) > 1:
-                print(DIM + f"  {'':>4} ↳ All working SNIs: " +
-                      ", ".join(f"{x['sni']}({x['latency']}ms)" for x in all_w) + W)
+                print(DIM+"    ↳ All working: "
+                      +", ".join(f"{x['sni']}({x.get('latency','?')}ms)" for x in all_w)+W)
 
-        print(M + "\n  ↑ SNI Mismatch work වෙනවා — bug host confirmed!" + W)
+    # ── Table 3: WS Real Payload ★ ────────────────────────────────
+    if ws_ok:
+        print(G+BOLD+f"\n[WS-PAYLOAD★] Real WebSocket Payload Works ({len(ws_ok)})\n"+W)
+        print(C+f"  {'HOST':<40} {'CODE':>5} {'KEY-OK':>7} {'LAT':>7}  SNIPPET"+W)
+        print(C+"  "+"─"*95+W)
+        for r in ws_ok:
+            w   = r["sni_methods"]["ws_real_payload"]
+            ko  = G+"✔"+W if w.get("key_verified") else Y+"?"+W
+            snip= w.get("response","")[:50].replace('\r','').replace('\n','│')
+            print(G+f"  {r['host']:<40}{W} {w.get('code','?'):>5} {ko:>7} "
+                  f"{Y}{w.get('latency','?')}ms{W}  {DIM}{snip}{W}")
 
-    # ── Table 3: All Methods Matrix ──────────────────────────────
-    METHODS_ORDER = ["direct_sni","sni_mismatch","sni_empty",
-                     "http_upgrade","http_connect","host_header_inject"]
-    MLABELS       = ["DirectSNI","Mismatch★","EmptySNI","WS-Up","CONNECT","HostInject"]
+    # ── Table 4: Domain Fronting ★ ────────────────────────────────
+    if front_ok:
+        print(Y+BOLD+f"\n[DOMAIN-FRONTING★] ({len(front_ok)})\n"+W)
+        print(C+f"  {'HOST':<38} {'FRONT SNI':<28} {'CODE':>5} {'LAT':>7}"+W)
+        print(C+"  "+"─"*85+W)
+        for r in front_ok:
+            f = r["sni_methods"]["domain_fronting"]
+            print(Y+f"  {r['host']:<38}{W} {G}{f.get('front_sni','?'):<28}{W} "
+                  f"{f.get('code','?'):>5} {Y}{f.get('latency','?')}ms{W}")
 
-    print(C + BOLD + f"\n[METHODS] Working Methods Matrix\n" + W)
-    print(C + f"  {'HOST':<40} " + "  ".join(f"{h:<11}" for h in MLABELS) + W)
-    print(C + "  " + "─" * 112 + W)
-    for r in results[:60]:
-        row = f"  {r['host']:<40} "
-        for mid in METHODS_ORDER:
-            v = r["sni_methods"].get(mid, {})
+    # ── Table 5: VLESS Probe ★ ────────────────────────────────────
+    if vless_ok:
+        print(B+BOLD+f"\n[VLESS-PROBE★] ({len(vless_ok)})\n"+W)
+        for r in vless_ok:
+            v = r["sni_methods"]["vless_probe"]
+            print(B+f"  {r['host']:<42}{W} latency:{Y}{v.get('latency','?')}ms{W}")
+
+    # ── Table 6: ECH Detection ────────────────────────────────────
+    if ech_ok:
+        print(M+BOLD+f"\n[ECH] Encrypted Client Hello Support ({len(ech_ok)})\n"+W)
+        print(C+f"  {'HOST':<42} {'ALPN':<15} ECH KEY"+W)
+        print(C+"  "+"─"*80+W)
+        for r in ech_ok:
+            e = r.get("ech",{})
+            alpn = ','.join(e.get("alpn",[])) or "?"
+            key  = e.get("ech_key","?") or "detected"
+            print(M+f"  {r['host']:<42}{W} {B}{alpn:<15}{W} {DIM}{key}{W}")
+
+    # ── Table 7: HTTP/2 + HTTP/3 ─────────────────────────────────
+    if h2_ok or h3_ok:
+        print(B+BOLD+f"\n[HTTP/2+3] Modern Protocol Support\n"+W)
+        print(C+f"  {'HOST':<42} {'HTTP/2':>7} {'HTTP/3 (QUIC)':>15} ALT-SVC"+W)
+        print(C+"  "+"─"*85+W)
+        for r in results:
+            h2 = r["http2"]
+            h3 = r.get("http3",{})
+            if h2 or h3.get("supported"):
+                alt = h3.get("alt_svc","") or ""
+                print(f"  {r['host']:<42} "
+                      + (G+"HTTP/2✔"+W if h2 else R+" —    "+W) + "   "
+                      + (G+"QUIC/H3✔"+W if h3.get("supported") else R+"  —     "+W)
+                      + f" {DIM}{alt[:30]}{W}")
+
+    # ── Table 8: Methods Matrix ───────────────────────────────────
+    M_ORDER = ["direct_sni","sni_mismatch","sni_empty","ws_real_payload",
+               "domain_fronting","http_connect","host_header_inject","vless_probe"]
+    M_HEAD  = ["DirectSNI","Mismatch★","EmptySNI","WS-Payload★",
+               "DomainFront★","CONNECT","HostInject","VLESS★"]
+    print(C+BOLD+f"\n[MATRIX] All Methods — Top 50\n"+W)
+    print(C+f"  {'HOST':<38} "+"  ".join(f"{h:<13}" for h in M_HEAD)+W)
+    print(C+"  "+"─"*148+W)
+    for r in results[:50]:
+        row = f"  {r['host']:<38} "
+        for mid in M_ORDER:
+            v = r["sni_methods"].get(mid,{})
             if v.get("works"):
                 lat = f"({v.get('latency','?')}ms)"
-                row += G + f"  ✔{lat:<9}" + W
+                row += G + f"  ✔{lat:<11}" + W
             else:
-                row += R + f"  ✘{'':9}" + W
+                row += R + f"  ✘{'':11}" + W
         print(row)
 
-    # ── Table 4: Direct SNI Detail (TLS Info) ────────────────────
-    direct_ok = [r for r in results if r["sni_methods"].get("direct_sni",{}).get("works")]
-    if direct_ok:
-        print(B + BOLD + f"\n[TLS] Direct-SNI Valid Hosts  ({len(direct_ok)} found)\n" + W)
-        print(C + f"  {'HOST':<40} {'TLS':>8} {'CIPHER':<28} {'BITS':>5} {'EXPIRY':<26} {'CN'}" + W)
-        print(C + "  " + "─" * 115 + W)
-        for r in direct_ok:
-            d = r["sni_methods"]["direct_sni"]
-            print(B + f"  {r['host']:<40}{W} {d.get('tls','?'):>8} "
-                  f"{d.get('cipher','?'):<28} {str(d.get('bits','?')):>5} "
-                  f"{d.get('expiry','?'):<26} {d.get('cn','?')}")
+    # ── Table 9: CDN/WAF Grouping ────────────────────────────────
+    cdn_groups = {}
+    for r in results:
+        for cdn in r["cdn"]:
+            cdn_groups.setdefault(cdn,[]).append(r["host"])
+    if cdn_groups:
+        print(B+BOLD+f"\n[CDN/WAF] Detected Services\n"+W)
+        print(C+f"  {'CDN/WAF':<22} {'COUNT':>6}  SAMPLE HOSTS"+W)
+        print(C+"  "+"─"*80+W)
+        for cdn,hosts in sorted(cdn_groups.items(), key=lambda x:len(x[1]),reverse=True):
+            sample = ", ".join(hosts[:3])
+            print(M+f"  {cdn:<22}{W} {Y}{len(hosts):>6}{W}  {DIM}{sample}{W}")
 
-    # ── Table 5: Port + HTTP/2 ───────────────────────────────────
-    with_ports = [r for r in results if r["open_ports"]]
-    if with_ports:
-        print(B + BOLD + f"\n[PORTS] Open Ports & HTTP/2\n" + W)
-        print(C + f"  {'HOST':<40} {'OPEN PORTS (latency)':<50} {'H2'}" + W)
-        print(C + "  " + "─" * 100 + W)
-        for r in with_ports[:50]:
-            ports = "  ".join(f"{G}{p}{W}({l}ms)" for p, l in sorted(r["open_ports"].items()))
-            h2    = G + "HTTP/2✔" + W if r["http2"] else ""
-            print(f"  {r['host']:<40} {ports:<50} {h2}")
+    # ── ASCII Stats ───────────────────────────────────────────────
+    total = len(results)
+    if total:
+        def bar(n,w=25):
+            f=int(w*n/total) if total else 0
+            return G+"█"*f+DIM+"░"*(w-f)+W+f" {n}/{total}"
+        print(C+BOLD+f"\n[STATS] Overview\n"+W)
+        print(C+f"  Bug Hosts       "+bar(len(bugs)))
+        print(C+f"  SNI Mismatch    "+bar(len(mismatches)))
+        print(C+f"  WS Payload ★    "+bar(len(ws_ok)))
+        print(C+f"  Domain Front ★  "+bar(len(front_ok)))
+        print(C+f"  VLESS Probe ★   "+bar(len(vless_ok)))
+        print(C+f"  ECH Support     "+bar(len(ech_ok)))
+        print(C+f"  HTTP/2          "+bar(len(h2_ok)))
+        print(C+f"  HTTP/3 QUIC     "+bar(len(h3_ok)))
 
-    # ── Final Summary ────────────────────────────────────────────
-    if bug_hosts:
-        print(G + BOLD + f"\n[BEST] Top Bug Hosts Summary\n" + W)
-        for i, r in enumerate(bug_hosts[:10], 1):
+    # ── Top Summary ───────────────────────────────────────────────
+    if bugs:
+        print(G+BOLD+f"\n[BEST] Top Bug Hosts\n"+W)
+        for i,r in enumerate(bugs[:10],1):
             methods = ", ".join(METHOD_LABELS.get(m,m) for m in r["working_methods"])
-            cdn_s   = f" [{', '.join(r['cdn'])}]" if r["cdn"] else ""
-            h2_s    = " [HTTP/2]"            if r["http2"] else ""
-            ip_s    = f" [{r['ip']}]"         if r["ip"]   else ""
-            print(G + f"  {i:>2}. {r['host']}" + W
-                  + Y + ip_s + W + M + cdn_s + W + B + h2_s + W)
-            print(C + f"      Score:{score_color(r['bug_score'])}{r['bug_score']}%{W}  "
+            cdn_s   = f" [{','.join(r['cdn'])}]"  if r["cdn"]           else ""
+            h2_s    = " [H2]"                      if r["http2"]          else ""
+            h3_s    = " [H3/QUIC]"                 if r.get("http3",{}).get("supported") else ""
+            ech_s   = " [ECH]"                     if r.get("ech",{}).get("supported")   else ""
+            ip_s    = f" [{r['ip']}]"              if r["ip"]             else ""
+            print(G+f"  {i:>2}. {r['host']}"+W
+                  +Y+ip_s+W+M+cdn_s+W+B+h2_s+h3_s+W+M+ech_s+W)
+            print(C+f"      Score:{sc(r['bug_score'])}{r['bug_score']}%{W}  "
                   f"Methods:{G} {methods}{W}\n")
 
-    # ── Subnet / IP Grouping ──────────────────────────────────────
-    subnet_groups = group_by_subnet(results)
-    if len(subnet_groups) > 1:
-        print(B + BOLD + f"\n[SUBNETS] IP Range Grouping\n" + W)
-        print(C + f"  {'SUBNET':<18} {'HOSTS':>6} {'BUG HOSTS':>10} {'BEST SCORE':>11}" + W)
-        print(C + "  " + "─" * 50 + W)
-        for subnet, group in list(subnet_groups.items())[:15]:
-            bugs_in = [r for r in group if r["is_bug_host"]]
-            best    = max(group, key=lambda x: x["bug_score"])["bug_score"]
-            sc      = score_color(best)
-            print(f"  {B}{subnet:<18}{W} {len(group):>6} {G}{len(bugs_in):>10}{W} "
-                  + sc + f"{best:>10}%{W}")
-
-    # ── ASCII Stats Chart ─────────────────────────────────────────
-    ascii_chart(results)
-
 # ================================================================
-#  Domain Scan Menu
+#  UI
 # ================================================================
+def clear(): os.system('cls' if os.name=='nt' else 'clear')
+
+def banner():
+    clear()
+    # Dep status
+    deps = {
+        "curl_cffi":  G+"✔"+W if curl_cffi  else R+"✘"+W,
+        "httpx/H2":   G+"✔"+W if httpx      else R+"✘"+W,
+        "aiohttp":    G+"✔"+W if aiohttp     else R+"✘"+W,
+        "aiodns":     G+"✔"+W if aiodns      else R+"✘"+W,
+        "dnspython":  G+"✔"+W if dns         else R+"✘"+W,
+    }
+    print(f"""
+{C}╔══════════════════════════════════════════════════════════════╗
+║  {G}{BOLD}SNI BUG HOST FINDER{C} v4.0                                 ║
+║  {DIM}Async I/O | TLS-Spoof | WS-Payload | Domain-Front | ECH{C}    ║
+╚══════════════════════════════════════════════════════════════╝{W}
+  {C}curl_cffi:{W}{deps['curl_cffi']}  {C}httpx/H2:{W}{deps['httpx/H2']}  {C}aiohttp:{W}{deps['aiohttp']}  {C}aiodns:{W}{deps['aiodns']}  {C}dnspython:{W}{deps['dnspython']}
+{Y}  [!] Educational & Research use only{W}
+""")
+
 def scan_domain_menu(cfg):
     banner()
-    domain = input(Y + "  [+] Target Domain (e.g. dialog.lk) : " + W).strip()
+    domain = input(Y+"  [+] Target Domain (e.g. dialog.lk) : "+W).strip()
     if not domain: return
 
-    bug_sni_raw = input(Y + "  [+] SNI Mismatch test host\n"
-                        "      (Enter = auto-detect | හෝ hostname type කරන්න) : " + W).strip()
-    bug_sni = bug_sni_raw if bug_sni_raw else "auto"
-    if bug_sni == "auto":
-        print(G + f"  [*] Auto mode — candidates {len(SNI_CANDIDATES)}ක් try කරනවා\n" + W)
+    bug_sni_raw = input(Y+"  [+] SNI Mismatch host\n"
+                        "      (Enter=auto | hostname type) : "+W).strip()
+    bug_sni = bug_sni_raw or "auto"
+    if bug_sni=="auto":
+        print(G+f"  [*] Auto mode — {len(SNI_CANDIDATES)} candidates try කරනවා"+W)
+
+    print(C+"\n  Settings (Enter=default):"+W)
+    t = input(Y+f"    Threads [{cfg['threads']}]: "+W).strip()
+    if t.isdigit(): cfg["threads"]=int(t)
+    ac= input(Y+f"    Async concurrency [{cfg['async_concurrency']}]: "+W).strip()
+    if ac.isdigit(): cfg["async_concurrency"]=int(ac)
+    to= input(Y+f"    Timeout [{cfg['timeout']}s]: "+W).strip()
+    if to.isdigit(): cfg["timeout"]=int(to)
+
+    # TLS fingerprint
+    if curl_cffi:
+        print(C+f"\n  TLS Profiles: "+", ".join(DEFAULT_CFG["tls_profiles"])+W)
+        tp = input(Y+f"  TLS profile [{cfg['tls_fingerprint']}]: "+W).strip()
+        if tp in DEFAULT_CFG["tls_profiles"]: cfg["tls_fingerprint"]=tp
     else:
-        print(G + f"  [*] Manual mode — {bug_sni}\n" + W)
+        print(Y+"  [!] curl_cffi না TLS fingerprint spoofing disabled"+W)
 
-    print(C + "\n  [*] Override settings (Enter = use defaults):" + W)
-    t  = input(Y + f"      Threads [{cfg['threads']}]: " + W).strip()
-    if t.isdigit():  cfg["threads"] = int(t)
-    to = input(Y + f"      Timeout [{cfg['timeout']}s]: " + W).strip()
-    if to.isdigit(): cfg["timeout"] = int(to)
+    subs = collect_subdomains(domain, cfg)
+    if not subs:
+        print(R+"\n  [-] Subdomains නෑ!"+W)
+        input(Y+"\n  Enter..."+W); return
 
-    subdomains = collect_subdomains(domain, cfg)
-    if not subdomains:
-        print(R + "\n  [-] Subdomains හොයාගන්න බැරි වුනා!" + W)
-        input(Y + "\n  Enter ඔබන්න..." + W); return
-
-    print(G + f"\n  [+] Subdomains: {len(subdomains)}  Bug-SNI: {bug_sni}\n" + W)
     t0      = time.time()
-    results = run_scan(subdomains, cfg, bug_sni, domain=domain)
-    print(C + f"\n  Scan time: {time.time()-t0:.1f}s\n" + W)
+    results = run_scan(subs, cfg, bug_sni, domain=domain)
+    elapsed = time.time()-t0
+    print(C+f"\n  Scan time: {elapsed:.1f}s\n"+W)
     display_results(results, domain)
-    input(Y + "\n  [!] Enter ඔබන්න..." + W)
+    input(Y+"\n  Enter ඔබන්න..."+W)
 
-# ================================================================
-#  Single Host Deep Check
-# ================================================================
 def single_host_menu(cfg):
     banner()
-    host = input(Y + "  [+] Host/Domain: " + W).strip()
+    host = input(Y+"  [+] Host/Domain: "+W).strip()
     if not host: return
 
-    bug_sni_raw = input(Y + "  [+] SNI Mismatch test host\n"
-                        "      (Enter = auto-detect | හෝ hostname type කරන්න) : " + W).strip()
-    bug_sni = bug_sni_raw if bug_sni_raw else "auto"
+    bug_sni_raw = input(Y+"  [+] SNI Mismatch host (Enter=auto): "+W).strip()
+    bug_sni = bug_sni_raw or "auto"
 
-    print(C + f"\n  Scanning '{host}'...\n" + W)
+    print(C+f"\n  '{host}' scanning...\n"+W)
     res = scan_host(host, cfg, bug_sni)
 
-    print(C + "  " + "═" * 65 + W)
-    print(f"  {BOLD}Host      :{W} {G}{res['host']}{W}")
-    print(f"  {BOLD}IP        :{W} {res['ip'] or '?'}")
-    print(f"  {BOLD}HTTP      :{W} {G if res['http_status']==200 else Y}{res['http_status'] or '---'}{W}")
-    print(f"  {BOLD}HTTPS     :{W} {G if res['https_status']==200 else Y}{res['https_status'] or '---'}{W}")
-    print(f"  {BOLD}Server    :{W} {res['server'] or 'Unknown'}")
-    print(f"  {BOLD}HTTP/2    :{W} {G+'✔ YES'+W if res['http2'] else R+'✘ NO'+W}")
-    print(f"  {BOLD}CDN       :{W} {M+', '.join(res['cdn'])+W if res['cdn'] else 'None'}")
-
+    print(C+"  "+"═"*68+W)
+    print(f"  {BOLD}Host        :{W} {G}{res['host']}{W}")
+    print(f"  {BOLD}IP          :{W} {res['ip'] or '?'}")
+    print(f"  {BOLD}HTTP        :{W} {G if res['http_status']==200 else Y}{res['http_status'] or '---'}{W}")
+    print(f"  {BOLD}HTTPS       :{W} {G if res['https_status']==200 else Y}{res['https_status'] or '---'}{W}")
+    print(f"  {BOLD}HTTP/2      :{W} {G+'✔'+W if res['http2'] else R+'✘'+W}")
+    print(f"  {BOLD}HTTP/3      :{W} {G+'✔ '+res.get('http3',{}).get('alt_svc','?')[:30]+W if res.get('http3',{}).get('supported') else R+'✘'+W}")
+    print(f"  {BOLD}ECH         :{W} {G+'✔ key:'+str(res.get('ech',{}).get('ech_key','?'))[:25]+W if res.get('ech',{}).get('supported') else R+'✘'+W}")
+    print(f"  {BOLD}TLS Spoof   :{W} {G+'curl_cffi '+cfg.get('tls_fingerprint','')+W if curl_cffi else DIM+'ssl fallback'+W}")
+    print(f"  {BOLD}CDN/WAF     :{W} {M+', '.join(res['cdn'])+W if res['cdn'] else 'None'}")
     if res["open_ports"]:
-        ports = "  ".join(f"{G}{p}{W}({l}ms)" for p, l in sorted(res["open_ports"].items()))
-        print(f"  {BOLD}Open Ports:{W} {ports}")
+        ps = "  ".join(f"{G}{p}{W}({l}ms)" for p,l in sorted(res["open_ports"].items()))
+        print(f"  {BOLD}Open Ports  :{W} {ps}")
 
-    print(C + "\n  [SNI Method Results]\n" + W)
-    print(C + f"  {'METHOD':<24} {'STATUS':<10} {'TLS':<10} {'LATENCY':<12} DETAIL" + W)
-    print(C + "  " + "─" * 72 + W)
+    print(C+"\n  [SNI Methods]\n"+W)
+    print(C+f"  {'METHOD':<24} {'STATUS':<8} {'TLS':<10} {'LAT':<10} DETAIL"+W)
+    print(C+"  "+"─"*78+W)
 
     for mid, label in METHOD_LABELS.items():
-        v = res["sni_methods"].get(mid, {})
+        v = res["sni_methods"].get(mid,{})
         if v.get("works"):
-            tls   = v.get("tls",     "")
+            tls   = v.get("tls","")
             lat   = f"{v.get('latency','?')}ms"
-            cn    = v.get("cn",      "") or ""
-            extra = f"cn:{cn}" if cn and cn != '?' else ""
-            extra += f"  code:{v.get('code','')}" if v.get('code') else ""
-
-            # sni_mismatch — use කළ SNI + ඔක්කොම working ඒවා show
-            if mid == "sni_mismatch":
-                sni_used = v.get("sni_used", "")
-                extra = f"sni_used:{G}{sni_used}{W}" if sni_used else extra
-                print(f"  {label:<24} {G}WORKS{W}      {tls:<10} {lat:<12} {extra}")
-                all_w = v.get("all_working", [])
-                if all_w:
-                    print(C + f"  {'':>4}↳ Working SNI candidates ({len(all_w)}):" + W)
-                    for x in all_w:
-                        print(G + f"  {'':>6}✔ {x['sni']:<30}{W} "
-                              f"{B}{x['tls']:<10}{W} {Y}{x['latency']}ms{W}")
+            if mid=="sni_mismatch":
+                detail = f"sni:{G}{v.get('sni_used','?')}{W}"
+                print(f"  {label:<24} {G}WORKS{W}    {tls:<10} {lat:<10} {detail}")
+                for x in v.get("all_working",[]):
+                    print(G+f"    ✔ {x['sni']:<32}{W} {B}{x.get('tls','?')}{W} {Y}{x.get('latency','?')}ms{W}")
+            elif mid=="ws_real_payload":
+                ko = G+"key✔"+W if v.get("key_verified") else Y+"key?"+W
+                detail = f"code:{v.get('code','?')} {ko}"
+                print(f"  {label:<24} {G}WORKS{W}    {tls:<10} {lat:<10} {detail}")
+            elif mid=="domain_fronting":
+                detail = f"front:{G}{v.get('front_sni','?')}{W} code:{v.get('code','?')}"
+                print(f"  {label:<24} {G}WORKS{W}    {'':10} {lat:<10} {detail}")
             else:
-                print(f"  {label:<24} {G}WORKS{W}      {tls:<10} {lat:<12} {DIM}{extra}{W}")
+                detail = f"code:{v.get('code','')}  cn:{v.get('cn','')}"
+                print(f"  {label:<24} {G}WORKS{W}    {tls:<10} {lat:<10} {DIM}{detail}{W}")
         else:
-            print(f"  {label:<24} {R}no resp{W}")
+            print(f"  {label:<24} {R}✘{W}")
 
-    sc      = score_color(res['bug_score'])
-    verdict = f"{G}{BOLD}★ BUG HOST{W}" if res["is_bug_host"] else f"{R}NOT a Bug Host{W}"
-    print(C + "\n  " + "─" * 65 + W)
-    print(f"  {BOLD}Bug Score :{W} {sc}{res['bug_score']}%{W}")
-    print(f"  {BOLD}Verdict   :{W} {verdict}")
-
+    print(C+"\n  "+"─"*68+W)
+    print(f"  {BOLD}Bug Score   :{W} {sc(res['bug_score'])}{res['bug_score']}%{W}")
+    verdict = G+BOLD+"★ BUG HOST"+W if res["is_bug_host"] else R+"NOT a Bug Host"+W
+    print(f"  {BOLD}Verdict     :{W} {verdict}")
     if res["working_methods"]:
-        methods = ", ".join(METHOD_LABELS.get(m,m) for m in res["working_methods"])
-        print(Y + f"\n  Working Methods: {G}{methods}{W}")
+        ms = ", ".join(METHOD_LABELS.get(m,m) for m in res["working_methods"])
+        print(Y+f"\n  Working: {G}{ms}{W}")
+    print(C+"  "+"═"*68+W)
+    input(Y+"\n  Enter ඔබன්න..."+W)
 
-    print(C + "  " + "═" * 65 + W)
-    input(Y + "\n  Enter ඔබන්න..." + W)
-
-# ================================================================
-#  Batch Scan (File)
-# ================================================================
 def batch_scan_menu(cfg):
     banner()
-    fpath = input(Y + "  [+] Domain list file (one domain per line): " + W).strip()
+    fpath = input(Y+"  [+] Domain list file (one per line): "+W).strip()
     if not os.path.exists(fpath):
-        print(R + f"  [-] File not found: {fpath}" + W)
-        input(Y + "  Enter ඔබන්න..." + W); return
-
+        print(R+f"  [-] File not found: {fpath}"+W)
+        input(Y+"  Enter..."+W); return
     with open(fpath) as f:
         domains = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+    bug_sni = input(Y+"  [+] Bug SNI host (Enter=auto): "+W).strip() or "auto"
+    print(G+f"  [+] Domains: {len(domains)}\n"+W)
+    for d in domains:
+        print(C+f"\n{'═'*50}\n  Scanning: {d}\n{'═'*50}"+W)
+        subs = collect_subdomains(d, cfg)
+        if not subs: print(R+f"  [-] No subdomains for {d}"+W); continue
+        results = run_scan(subs, cfg, bug_sni, domain=d)
+        display_results(results, d)
+    input(Y+"\n  Enter ඔබන්න..."+W)
 
-    bug_sni_raw = input(Y + "  [+] SNI Mismatch test host (Enter = auto-detect): " + W).strip()
-    bug_sni = bug_sni_raw if bug_sni_raw else "auto"
+def deps_menu():
+    banner()
+    print(C+"  [DEPENDENCIES]\n"+W)
+    deps_info = [
+        ("aiohttp",    "Async HTTP scanning (ඉතාම ඉක්මන්)"),
+        ("aiodns",     "Async DNS resolve"),
+        ("httpx[http2]","HTTP/2 accurate check"),
+        ("curl_cffi",  "TLS fingerprint spoofing (Chrome/Firefox)"),
+        ("dnspython",  "ECH / DNS HTTPS record lookup"),
+    ]
+    missing = []
+    for pkg, desc in deps_info:
+        mod = pkg.split('[')[0].replace('-','_')
+        ok  = _try_import(mod) is not None
+        status = G+"✔ installed"+W if ok else R+"✘ missing"+W
+        print(f"  {pkg:<20} {status}  {DIM}{desc}{W}")
+        if not ok: missing.append(pkg)
 
-    print(G + f"  [+] Domains: {len(domains)}\n" + W)
+    if missing:
+        print(Y+f"\n  Install command:\n  {G}pip install {' '.join(missing)}{W}\n")
+    else:
+        print(G+"\n  ✔ All dependencies installed!\n"+W)
+    input(Y+"\n  Enter ඔබන්න..."+W)
 
-    for domain in domains:
-        print(C + f"\n{'═'*50}\n  Scanning: {domain}\n{'═'*50}" + W)
-        subs = collect_subdomains(domain, cfg)
-        if not subs:
-            print(R + f"  [-] No subdomains for {domain}" + W); continue
-        results = run_scan(subs, cfg, bug_sni)
-        display_results(results, domain)
-
-    input(Y + "\n  Enter ඔබන්න..." + W)
-
-# ================================================================
-#  Config Editor
-# ================================================================
 def config_menu(cfg):
     while True:
         banner()
-        print(Y + "  [CONFIG EDITOR]\n" + W)
-        print(C + f"  1. Threads       : {cfg['threads']}" + W)
-        print(C + f"  2. Timeout       : {cfg['timeout']}s" + W)
-        print(C + f"  3. HTTPS Check   : {cfg['check_https']}" + W)
-        print(C + f"  4. SNI Check     : {cfg['check_sni']}" + W)
-        print(C + f"  5. HTTP/2 Check  : {cfg.get('check_http2', True)}" + W)
-        print(C + f"  6. CRT.sh        : {cfg['use_crtsh']}" + W)
-        print(C + f"  7. AlienVault    : {cfg['use_alienvault']}" + W)
-        print(C + f"  8. Save & Back" + W)
-        print(C + f"  9. Back (no save)" + W)
+        print(Y+"  [CONFIG EDITOR]\n"+W)
+        fields = [
+            ("1","threads",         "Threads",          cfg["threads"]),
+            ("2","async_concurrency","Async concurrency",cfg["async_concurrency"]),
+            ("3","timeout",         "Timeout (s)",      cfg["timeout"]),
+            ("4","tls_fingerprint", "TLS profile",      cfg["tls_fingerprint"]),
+            ("5","check_https",     "HTTPS check",      cfg["check_https"]),
+            ("6","check_sni",       "SNI check",        cfg["check_sni"]),
+            ("7","check_http2",     "HTTP/2 check",     cfg["check_http2"]),
+            ("8","check_http3",     "HTTP/3 check",     cfg.get("check_http3",False)),
+            ("9","check_ws_payload","WS Payload test",  cfg.get("check_ws_payload",True)),
+            ("a","check_fronting",  "Domain Fronting",  cfg.get("check_fronting",True)),
+            ("b","check_ech",       "ECH detect",       cfg.get("check_ech",True)),
+            ("c","use_crtsh",       "CRT.sh subdomains",cfg["use_crtsh"]),
+            ("d","use_alienvault",  "AlienVault subs",  cfg["use_alienvault"]),
+        ]
+        for num, key, label, val in fields:
+            print(C+f"  [{num}] {label:<22}: {G if val==True else (R if val==False else Y)}{val}{W}")
+        print(Y+"\n  [s] Save & Back  [q] Back"+W)
+        ch = input(C+"\n  Choice: "+W).strip().lower()
 
-        ch = input(C + "\n  Choice: " + W).strip()
-        if ch == '1':
-            v = input(Y + f"  Threads [{cfg['threads']}]: " + W).strip()
-            if v.isdigit(): cfg["threads"] = int(v)
-        elif ch == '2':
-            v = input(Y + f"  Timeout [{cfg['timeout']}]: " + W).strip()
-            if v.isdigit(): cfg["timeout"] = int(v)
-        elif ch == '3': cfg["check_https"]  = not cfg["check_https"]
-        elif ch == '4': cfg["check_sni"]    = not cfg["check_sni"]
-        elif ch == '5': cfg["check_http2"]  = not cfg.get("check_http2", True)
-        elif ch == '6': cfg["use_crtsh"]    = not cfg["use_crtsh"]
-        elif ch == '7': cfg["use_alienvault"]= not cfg["use_alienvault"]
-        elif ch == '8': save_config(cfg); break
-        elif ch == '9': break
+        if ch=='s': save_cfg(cfg); break
+        elif ch=='q': break
+        else:
+            found = next((f for f in fields if f[0]==ch), None)
+            if found:
+                _, key, label, val = found
+                if isinstance(val, bool):
+                    cfg[key] = not cfg[key]
+                elif isinstance(val, int):
+                    v = input(Y+f"  {label} [{val}]: "+W).strip()
+                    if v.isdigit(): cfg[key]=int(v)
+                elif isinstance(val, str):
+                    v = input(Y+f"  {label} [{val}]: "+W).strip()
+                    if v: cfg[key]=v
 
-# ================================================================
-#  Main Menu
-# ================================================================
 def main():
-    import urllib3
-    urllib3.disable_warnings()
-    cfg = load_config()
+    try:
+        import urllib3
+        urllib3.disable_warnings()
+    except: pass
+
+    cfg = load_cfg()
 
     while True:
         banner()
-        print(Y + "  ┌──────────────────────────────────────────────┐" + W)
-        print(Y + "  │              MAIN MENU                       │" + W)
-        print(Y + "  ├──────────────────────────────────────────────┤" + W)
-        print(Y + "  │  " + W + "[1]  Domain Scan     (Subdomains + SNI)  " + Y + "│" + W)
-        print(Y + "  │  " + W + "[2]  Single Host     (Deep Check)        " + Y + "│" + W)
-        print(Y + "  │  " + W + "[3]  Batch Scan      (File Input)        " + Y + "│" + W)
-        print(Y + "  │  " + W + "[4]  Settings / Config                   " + Y + "│" + W)
-        print(Y + "  │  " + W + "[5]  Exit                                " + Y + "│" + W)
-        print(Y + "  └──────────────────────────────────────────────┘\n" + W)
+        print(Y+"  ┌────────────────────────────────────────────────┐"+W)
+        print(Y+"  │               MAIN MENU                        │"+W)
+        print(Y+"  ├────────────────────────────────────────────────┤"+W)
+        print(Y+"  │  "+W+"[1]  Domain Scan  (Async + Full SNI)      "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[2]  Single Host  (Deep Check)             "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[3]  Batch Scan   (File Input)             "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[4]  Settings / Config                     "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[5]  Dependencies Status                   "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[6]  Exit                                  "+Y+"  │"+W)
+        print(Y+"  └────────────────────────────────────────────────┘\n"+W)
 
-        ch = input(C + "  Choice (1-5): " + W).strip()
-        if   ch == '1': scan_domain_menu(cfg)
-        elif ch == '2': single_host_menu(cfg)
-        elif ch == '3': batch_scan_menu(cfg)
-        elif ch == '4': config_menu(cfg)
-        elif ch == '5':
-            print(G + "\n  ජය වේවා! 👋\n" + W); sys.exit(0)
+        ch = input(C+"  Choice (1-6): "+W).strip()
+        if   ch=='1': scan_domain_menu(cfg)
+        elif ch=='2': single_host_menu(cfg)
+        elif ch=='3': batch_scan_menu(cfg)
+        elif ch=='4': config_menu(cfg)
+        elif ch=='5': deps_menu()
+        elif ch=='6':
+            print(G+"\n  ජය වේවා! 👋\n"+W); sys.exit(0)
         else:
-            print(R + "\n  [-] 1-5 ඇතුලත් කරන්න.\n" + W)
-            time.sleep(1)
+            print(R+"\n  [-] 1-6 ඇතුලත් කරන්න.\n"+W); time.sleep(1)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
