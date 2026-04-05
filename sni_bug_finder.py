@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
 # ================================================================
-#   PRO SNI BUG HOST FINDER v4.1  (Bug-Fixed + Upgraded)
+#   PRO SNI BUG HOST FINDER v4.2
 #   ─────────────────────────────────────────────────────────────
-#   FIXES v4.1:
+#   FIXES v4.1 → v4.2:
 #     [1] check_ech() UnboundLocalError — dns global shadowing fixed
 #     [2] bytes.lower() AttributeError  — Python 3 bytes fix
-#     [3] asyncio.get_event_loop() deprecated → get_running_loop()
-#     [4] detect_all_methods() empty CDN dict → real CDN pass
-#     [5] Domain itself added to scan list as fallback
-#   NEW v4.1:
+#     [3] asyncio.get_event_loop() → get_running_loop() (3.10+)
+#     [4] detect_all_methods() empty CDN → real CDN pass
+#     [5] Domain itself always in scan list
+#     [6] export_results missing def fixed
+#     [7] single_host_menu corrupted input() fixed
+#     [8] aiodns query() deprecated → query_dns() with fallback
+#   SPEED v4.2:
+#     [S1] auto_detect_sni_mismatch: 31×5s serial → 16 threads
+#          parallel, 2s timeout, stop after 3 found (~3s max)
+#     [S2] auto_domain_fronting: 6×5s serial → 6 threads parallel
+#          2s timeout, stop on first found (~3s max)
+#   NEW v4.2:
 #     [+] BufferOver.run + RapidDNS subdomain sources
-#     [+] JSON + TXT export after scan
-#     [+] Retry logic in scan_host
+#     [+] 3x-ui VPN Config Advisor — protocol/transport/TLS/SNI
+#          auto-recommend from scan results
 #   ─────────────────────────────────────────────────────────────
+#   Install: pip install aiohttp aiodns httpx[http2] curl_cffi dnspython
+#   Usage  : python3 sni_bug_finder.py
+# ================================================================
 #   Install: pip install aiohttp aiodns httpx[http2] curl_cffi dnspython
 #   Usage  : python3 sni_bug_finder.py
 # ================================================================
@@ -276,16 +287,16 @@ def http2_get(hostname, timeout=5):
 async def async_resolve(hostname, resolver=None):
     try:
         if resolver:
-            # FIX: query() deprecated in newer aiodns → use query_dns() with fallback
+            # FIX: query() deprecated newer aiodns → query_dns() with fallback
             try:
                 result = await resolver.query_dns(hostname, 'A')
                 hosts  = [r.host for r in result.get('A', [])]
                 return hosts[0] if hosts else None
-            except AttributeError:
+            except (AttributeError, TypeError):
                 result = await resolver.query(hostname, 'A')
                 return result[0].host if result else None
         else:
-            loop = asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()   # FIX: get_event_loop() deprecated 3.10+
             res  = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
             return res[0][4][0] if res else None
     except: return None
@@ -307,9 +318,9 @@ async def async_batch_resolve(hostnames, concurrency=100):
             # aiodns fail වුනොත් සාමාන්‍ය Python DNS වලින් try කිරීම (Fallback)
             if not ip:
                 try:
-                    loop = asyncio.get_event_loop()
-                    res = await loop.getaddrinfo(h, None, family=socket.AF_INET)
-                    ip = res[0][4][0] if res else None
+                    loop = asyncio.get_running_loop()   # FIX: get_event_loop deprecated
+                    res  = await loop.getaddrinfo(h, None, family=socket.AF_INET)
+                    ip   = res[0][4][0] if res else None
                 except: pass
             
             if ip:
@@ -404,8 +415,7 @@ def method_sni_mismatch(real_host, sni_host, port, timeout):
 
 def auto_detect_sni_mismatch(hostname, port, timeout):
     """
-    SPEED FIX: Serial loop 31×5s=155s → Parallel threads, 2s timeout, early exit.
-    3 working SNI found වූ වහාම stop කරනවා.
+    SPEED FIX: Serial 31×5s=155s → Parallel 16 threads, 2s timeout, stop after 3 found.
     """
     working = []
     w_lock  = threading.Lock()
@@ -413,20 +423,19 @@ def auto_detect_sni_mismatch(hostname, port, timeout):
     fast_to = min(timeout, 2)   # 2s per attempt — TLS handshake fast enough
 
     def try_one(candidate):
-        if stop_ev.is_set():
-            return
+        if stop_ev.is_set(): return
         r = method_sni_mismatch(hostname, candidate, port, fast_to)
         if r.get("works"):
             r["sni"] = candidate
             with w_lock:
                 working.append(r)
-                if len(working) >= 3:   # 3 results enough — stop early
+                if len(working) >= 3:   # 3 working SNIs enough
                     stop_ev.set()
 
     from concurrent.futures import ThreadPoolExecutor as _TPE, wait as _wait
     with _TPE(max_workers=16) as ex:
         futs = [ex.submit(try_one, c) for c in SNI_CANDIDATES]
-        _wait(futs, timeout=fast_to + 1)   # overall max wait
+        _wait(futs, timeout=fast_to + 1)   # overall max wait: 3s
 
     return working
 
@@ -563,7 +572,7 @@ def method_domain_fronting(real_host, front_sni, real_backend, port, timeout):
 
 def auto_domain_fronting(hostname, cdn_list, port, timeout):
     """
-    SPEED FIX: Serial 6×5s=30s → Parallel threads, 2s timeout, 3 candidates only.
+    SPEED FIX: Serial 6×5s=30s → Parallel 6 threads, 2s timeout, stop on first found.
     """
     front_candidates = [
         "free.facebook.com","zero.facebook.com",
@@ -578,8 +587,7 @@ def auto_domain_fronting(hostname, cdn_list, port, timeout):
     found_ev = threading.Event()
 
     def try_front(front):
-        if found_ev.is_set():
-            return
+        if found_ev.is_set(): return
         r = method_domain_fronting(hostname, front, hostname, port, fast_to)
         if r.get("works"):
             with r_lock:
@@ -590,7 +598,7 @@ def auto_domain_fronting(hostname, cdn_list, port, timeout):
     from concurrent.futures import ThreadPoolExecutor as _TPE, wait as _wait
     with _TPE(max_workers=6) as ex:
         futs = [ex.submit(try_front, f) for f in front_candidates[:6]]
-        _wait(futs, timeout=fast_to + 1)
+        _wait(futs, timeout=fast_to + 1)   # max 3s total
 
     return result
 
@@ -980,10 +988,6 @@ def collect_subdomains(domain, cfg):
 #  Main Host Scanner
 # ================================================================
 def scan_host(hostname, cfg, bug_sni, pre_ip=None, _retry=1):
-    """
-    SPEED FIX: Per-method timeouts short කළා.
-    auto_detect_sni_mismatch + auto_domain_fronting parallel කළා.
-    """
     result = {
         "host":            hostname,
         "ip":              pre_ip,
@@ -1409,6 +1413,202 @@ def display_results(results, domain):
             print(C+f"      Score:{sc(r['bug_score'])}{r['bug_score']}%{W}  "
                   f"Methods:{G} {methods}{W}\n")
 
+
+# ================================================================
+#  3x-ui VPN Config Advisor
+# ================================================================
+def _best_port(open_ports, prefer_tls=True):
+    """Best port select කරනවා — TLS ports priority"""
+    tls_ports = [443, 8443, 2053, 2083, 2087, 2096]
+    tcp_ports  = [80, 8080, 2052, 2082, 2086, 2095]
+    if prefer_tls:
+        for p in tls_ports:
+            if p in open_ports: return p, True
+        for p in tcp_ports:
+            if p in open_ports: return p, False
+    else:
+        for p in tcp_ports:
+            if p in open_ports: return p, False
+        for p in tls_ports:
+            if p in open_ports: return p, True
+    return (list(open_ports)[0] if open_ports else 443), prefer_tls
+
+def analyze_3xui(r):
+    """
+    Scan result එකෙන් best 3x-ui inbound config suggest කරනවා.
+    Returns dict with all settings needed for 3x-ui panel.
+    """
+    m         = r["sni_methods"]
+    op        = r["open_ports"]
+    host      = r["host"]
+    ip        = r["ip"] or host
+    cdn       = r.get("cdn", [])
+    has_h2    = r.get("http2", False)
+
+    ws_ok     = m.get("ws_real_payload",   {}).get("works", False)
+    mismatch  = m.get("sni_mismatch",      {})
+    mismatch_ok = mismatch.get("works", False)
+    front_ok  = m.get("domain_fronting",   {}).get("works", False)
+    vless_ok  = m.get("vless_probe",       {}).get("works", False)
+    connect_ok= m.get("http_connect",      {}).get("works", False)
+
+    sni_host  = mismatch.get("sni_used", "") if mismatch_ok else host
+    tls_ver   = mismatch.get("tls", "TLSv1.3") if mismatch_ok else "TLSv1.3"
+    front_sni = m.get("domain_fronting",{}).get("front_sni","") if front_ok else ""
+
+    # ── Transport decision tree ───────────────────────────────────
+    # Priority: WS > gRPC (H2) > HTTPUpgrade > TCP
+    if ws_ok:
+        transport = "ws"
+        port, use_tls = _best_port(op, prefer_tls=True)
+    elif has_h2:
+        transport = "grpc"
+        port, use_tls = _best_port(op, prefer_tls=True)
+    elif connect_ok:
+        transport = "httpupgrade"
+        port, use_tls = _best_port(op, prefer_tls=False)
+    else:
+        transport = "tcp"
+        port, use_tls = _best_port(op, prefer_tls=True)
+
+    # No TLS port found — fallback to 443
+    if not op:
+        port, use_tls = 443, True
+
+    # ── Protocol decision ─────────────────────────────────────────
+    # VLESS = lightest + best; VMess = fallback; Trojan = HTTPS-like
+    if vless_ok or ws_ok or has_h2:
+        protocol = "vless"
+    elif front_ok:
+        protocol = "trojan"   # Trojan works well with CDN fronting
+    else:
+        protocol = "vmess"
+
+    # ── Security mode ─────────────────────────────────────────────
+    if use_tls and mismatch_ok:
+        security = "tls"
+        allow_insecure = True   # SNI mismatch = cert verify skip
+    elif use_tls:
+        security = "tls"
+        allow_insecure = False
+    else:
+        security = "none"
+        allow_insecure = False
+
+    # ── WS path ───────────────────────────────────────────────────
+    ws_path = "/"
+
+    # ── Fingerprint ───────────────────────────────────────────────
+    fingerprint = "chrome"
+
+    # ── CDN note ─────────────────────────────────────────────────
+    cdn_note = ""
+    if "Cloudflare" in cdn:
+        cdn_note = "Cloudflare CDN ⚡ — Domain Fronting ✔"
+    elif "Akamai" in cdn:
+        cdn_note = "Akamai CDN — Fronting possible"
+    elif "AWS CloudFront" in cdn:
+        cdn_note = "AWS CloudFront — Fronting possible"
+    elif cdn:
+        cdn_note = f"CDN: {', '.join(cdn[:2])}"
+
+    return {
+        "host":           host,
+        "ip":             ip,
+        "port":           port,
+        "protocol":       protocol,
+        "transport":      transport,
+        "security":       security,
+        "sni":            sni_host,
+        "allow_insecure": allow_insecure,
+        "fingerprint":    fingerprint,
+        "ws_path":        ws_path,
+        "tls_version":    tls_ver,
+        "front_sni":      front_sni,
+        "cdn":            cdn,
+        "cdn_note":       cdn_note,
+        "ws_works":       ws_ok,
+        "grpc_works":     has_h2,
+        "vless_probe":    vless_ok,
+        "fronting":       front_ok,
+        "bug_score":      r["bug_score"],
+    }
+
+def display_3xui_configs(results):
+    """Top bug hosts වල 3x-ui config screen-friendly format එකෙන් print"""
+    bugs = [r for r in results if r["is_bug_host"]]
+    if not bugs:
+        print(Y+"  [!] Bug hosts නෑ — 3x-ui config generate කරන්න බෑ."+W)
+        return
+
+    print(f"\n{M}{'═'*72}{W}")
+    print(M+BOLD+"  ★  3x-ui INBOUND CONFIG GUIDE  ★"+W)
+    print(f"{M}{'═'*72}{W}\n")
+
+    for i, r in enumerate(bugs[:8], 1):
+        cfg = analyze_3xui(r)
+
+        # ── Header ───────────────────────────────────────────────
+        print(G+BOLD+f"  [{i}] {cfg['host']}"+W
+              + DIM+f"  (IP: {cfg['ip']})"+W
+              + (f"  {Y}{cfg['cdn_note']}{W}" if cfg['cdn_note'] else ""))
+        print(C+"  "+f"{'─'*68}"+W)
+
+        # ── Transport + Protocol summary ──────────────────────────
+        tr_clr = G if cfg['transport']=='ws' else (B if cfg['transport']=='grpc' else Y)
+        pr_clr = G if cfg['protocol']=='vless' else Y
+        print(f"  {BOLD}Protocol  :{W} {pr_clr}{cfg['protocol'].upper()}{W}   "
+              f"{BOLD}Transport :{W} {tr_clr}{cfg['transport'].upper()}{W}   "
+              f"{BOLD}Port :{W} {G}{cfg['port']}{W}")
+        print(f"  {BOLD}Security  :{W} {G if cfg['security']=='tls' else Y}{cfg['security'].upper()}{W}   "
+              f"{BOLD}Fingerprint:{W} {cfg['fingerprint']}   "
+              f"{BOLD}AllowInsecure:{W} {G+'true'+W if cfg['allow_insecure'] else DIM+'false'+W}")
+        print(f"  {BOLD}SNI       :{W} {G}{cfg['sni']}{W}"
+              + (f"   {DIM}(mismatch mode){W}" if cfg['sni'] != cfg['host'] else ""))
+
+        if cfg['transport'] == 'ws':
+            print(f"  {BOLD}WS Path   :{W} {cfg['ws_path']}")
+        if cfg['transport'] == 'grpc':
+            print(f"  {BOLD}gRPC Mode :{W} multi")
+        if cfg['front_sni']:
+            print(f"  {BOLD}Front SNI :{W} {Y}{cfg['front_sni']}{W}  {DIM}(Domain Fronting){W}")
+
+        # ── 3x-ui panel settings box ──────────────────────────────
+        print(C+f"\n  ┌─ 3x-ui Panel Settings {'─'*44}┐{W}")
+        print(C+f"  │{W} Remark      : {G}{cfg['host']}{W}")
+        print(C+f"  │{W} Protocol    : {G}{cfg['protocol']}{W}")
+        print(C+f"  │{W} Port        : {G}{cfg['port']}{W}")
+        print(C+f"  │{W} Network     : {G}{cfg['transport']}{W}")
+        if cfg['transport'] == 'ws':
+            print(C+f"  │{W} WS Path     : {G}{cfg['ws_path']}{W}")
+            print(C+f"  │{W} WS Host     : {G}{cfg['sni']}{W}")
+        elif cfg['transport'] == 'grpc':
+            print(C+f"  │{W} gRPC Mode   : {G}multi{W}")
+            print(C+f"  │{W} Service Name: {G}grpc{W}")
+        print(C+f"  │{W} TLS         : {G if cfg['security']=='tls' else Y}{cfg['security']}{W}")
+        if cfg['security'] == 'tls':
+            print(C+f"  │{W} SNI         : {G}{cfg['sni']}{W}")
+            print(C+f"  │{W} Fingerprint : {G}{cfg['fingerprint']}{W}")
+            print(C+f"  │{W} allowInsecure: {G+'true'+W if cfg['allow_insecure'] else 'false'}")
+        print(C+f"  └{'─'*50}┘{W}")
+
+        # ── Capability badges ─────────────────────────────────────
+        badges = []
+        if cfg['ws_works']:   badges.append(G+"WS✔"+W)
+        if cfg['grpc_works']: badges.append(B+"gRPC✔"+W)
+        if cfg['vless_probe']:badges.append(G+"VLESS✔"+W)
+        if cfg['fronting']:   badges.append(Y+"Fronting✔"+W)
+        if badges:
+            print(f"  Capabilities: "+" │ ".join(badges))
+
+        print(f"  {BOLD}Bug Score :{W} {sc(cfg['bug_score'])}{cfg['bug_score']}%{W}\n")
+
+    print(M+"  "+f"{'═'*70}"+W)
+    print(Y+BOLD+"  NOTE: UUID/Password 3x-ui panel එකේ generate කරන්න."+W)
+    print(Y+"  SNI mismatch mode: client-side ද allow_insecure=true set කරන්න."+W)
+    print(M+"  "+f"{'═'*70}"+W+"\n")
+
+
 def export_results(results, domain):
     """Scan results JSON + TXT format export කරනවා"""
     import datetime
@@ -1473,7 +1673,7 @@ def banner():
     }
     print(f"""
 {C}╔══════════════════════════════════════════════════════════════╗
-║  {G}{BOLD}SNI BUG HOST FINDER{C} v4.1  {DIM}(Bug-Fixed){C}                   ║
+║  {G}{BOLD}SNI BUG HOST FINDER{C} v4.2  {DIM}(Speed+3xui){C}                   ║
 ║  {DIM}Async I/O | TLS-Spoof | WS-Payload | Domain-Front | ECH{C}    ║
 ╚══════════════════════════════════════════════════════════════╝{W}
   {C}curl_cffi:{W}{deps['curl_cffi']}  {C}httpx/H2:{W}{deps['httpx/H2']}  {C}aiohttp:{W}{deps['aiohttp']}  {C}aiodns:{W}{deps['aiodns']}  {C}dnspython:{W}{deps['dnspython']}
@@ -1517,6 +1717,7 @@ def scan_domain_menu(cfg):
     elapsed = time.time()-t0
     print(C+f"\n  Scan time: {elapsed:.1f}s\n"+W)
     display_results(results, domain)
+    display_3xui_configs(results)
     input(Y+"\n  Enter ඔබන්න..."+W)
 
 def single_host_menu(cfg):
@@ -1579,7 +1780,10 @@ def single_host_menu(cfg):
         ms = ", ".join(METHOD_LABELS.get(m,m) for m in res["working_methods"])
         print(Y+f"\n  Working: {G}{ms}{W}")
     print(C+"  "+"═"*68+W)
-    input(Y+"\n  Enter ඔබன්න..."+W)
+    # 3x-ui config for single host
+    if res["is_bug_host"]:
+        display_3xui_configs([res])
+    input(Y+"\n  Enter ඔබන්න..."+W)
 
 def batch_scan_menu(cfg):
     banner()
@@ -1597,6 +1801,7 @@ def batch_scan_menu(cfg):
         if not subs: print(R+f"  [-] No subdomains for {d}"+W); continue
         results = run_scan(subs, cfg, bug_sni, domain=d)
         display_results(results, d)
+        display_3xui_configs(results)
     input(Y+"\n  Enter ඔබන්න..."+W)
 
 def deps_menu():
