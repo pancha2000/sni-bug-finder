@@ -271,26 +271,27 @@ def http2_get(hostname, timeout=5):
     except: return None, False
 
 # ================================================================
-#  Async DNS Resolver
+#  Async DNS Resolver (FIXED FOR TERMUX)
 # ================================================================
 async def async_resolve(hostname, resolver=None):
     try:
         if resolver:
-            result = await resolver.gethostbyname(hostname, socket.AF_INET)
-            return result.addresses[0] if result.addresses else None
+            # Termux Warning එක නැති කිරීමට query() භාවිතා කිරීම
+            result = await resolver.query(hostname, 'A')
+            return result[0].host if result else None
         else:
-            loop = asyncio.get_running_loop()   # FIX: deprecated get_event_loop
-            ip = await loop.run_in_executor(None, socket.gethostbyname, hostname)
-            return ip
+            loop = asyncio.get_event_loop()
+            res = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
+            return res[0][4][0] if res else None
     except: return None
 
 async def async_batch_resolve(hostnames, concurrency=100):
-    """aiodns parallel DNS resolve"""
     resolved = {}
     resolver = None
     if aiodns:
         try:
-            resolver = aiodns.DNSResolver()
+            # Termux සඳහා අනිවාර්යයෙන්ම Public DNS ලබා දිය යුතුය
+            resolver = aiodns.DNSResolver(nameservers=['8.8.8.8', '1.1.1.1'])
         except: pass
 
     sem = asyncio.Semaphore(concurrency)
@@ -298,6 +299,14 @@ async def async_batch_resolve(hostnames, concurrency=100):
     async def one(h):
         async with sem:
             ip = await async_resolve(h, resolver)
+            # aiodns fail වුනොත් සාමාන්‍ය Python DNS වලින් try කිරීම (Fallback)
+            if not ip:
+                try:
+                    loop = asyncio.get_event_loop()
+                    res = await loop.getaddrinfo(h, None, family=socket.AF_INET)
+                    ip = res[0][4][0] if res else None
+                except: pass
+            
             if ip:
                 resolved[h] = ip
 
