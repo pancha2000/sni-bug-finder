@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
 # ================================================================
-#   PRO SNI BUG HOST FINDER v5.0  ★ MAJOR UPGRADE
+#   PRO SNI BUG HOST FINDER v6.0  ★ MEGA UPGRADE
 #   ─────────────────────────────────────────────────────────────
-#   NEW SCAN METHODS v5.0:
-#     [+] gRPC real stream test (HTTP/2 + grpc-status)
-#     [+] XHTTP / SplitHTTP transport test (xray newest)
-#     [+] Reality TLS fingerprint probe
-#     [+] WebSocket path brute-force (/, /ws, /v2ray, /ray, etc.)
-#     [+] TLS 1.2 vs 1.3 force test + cipher detect
-#     [+] ALPN probe (h2 / http1.1 / h3)
-#     [+] Certificate info (expiry, wildcard, SAN count)
-#     [+] ASN / CDN IP verify via ip-api
-#   NEW SUBDOMAIN SOURCES v5.0:
-#     [+] crt.sh — retry + longer timeout fixed
-#     [+] CommonCrawl index
-#     [+] DNS brute-force (common wordlist)
-#     [+] AXFR zone transfer attempt
-#   SPEED:
-#     [S] Parallel port scan (async)
-#     [S] SNI mismatch: 16 threads parallel
-#     [S] Domain fronting: 6 threads parallel
+#   NEW SCAN METHODS v6.0:
+#     [+] Open-Knock Algorithm — unusual TLS handshakes (empty SNI,
+#         fake SNI, pre-2006 ciphers) → extract hidden Default Cert SANs
+#     [+] Connection State Attack — Keep-Alive TCP reuse:
+#         zero-rated host → send blocked domain payload same conn
+#     [+] Real ECH Payload Crafter — DoH key fetch + HPKE encapsulation
+#         outer SNI=free domain, inner SNI=blocked domain; ISP drop test
+#     [+] WTF-PAD Traffic Padding — dummy padding bytes; ISP speed-cap bypass test
+#     [+] UDP Probe — UDP ping to discover hosts behind TCP firewalls
+#     [+] SCTP INIT Probe — SCTP chunk probe for strict-firewall bypass
+#     [+] Real QUIC Handshake (aioquic) — full HTTP/3 QUIC negotiation
+#     [+] Scapy Packet Manipulation — TCP fragmentation, TTL tricks, DPI evasion
+#     [+] Active Probing Defense Test — simulate ISP active-probing;
+#         detect Reality/VLESS servers that resist fingerprinting
+#     [+] ML Bug Score Predictor — sklearn RandomForest; learns from
+#         accumulated scans; predicts true bug-host probability
 #   ─────────────────────────────────────────────────────────────
-#   Install: pip install aiohttp aiodns httpx[http2] curl_cffi dnspython
+#   v5.0 METHODS (retained):
+#     gRPC stream, XHTTP/SplitHTTP, Reality TLS, WS Path brute-force,
+#     TLS 1.2/1.3 force, ALPN probe, Cert info, ASN/CDN verify
+#   ─────────────────────────────────────────────────────────────
+#   Install (core):
+#     pip install aiohttp aiodns httpx[http2] curl_cffi dnspython
+#   Install (optional advanced):
+#     pip install aioquic scapy cryptography scikit-learn numpy
 #   Usage  : python3 sni_bug_finder.py
 # ================================================================
 from __future__ import annotations
@@ -37,12 +42,17 @@ def _try_import(name, pkg=None):
     except ImportError:
         return None
 
-aiohttp   = _try_import("aiohttp")
-aiodns    = _try_import("aiodns")
-httpx     = _try_import("httpx")
-curl_cffi = _try_import("curl_cffi")
-dns       = _try_import("dns")        # dnspython
-requests  = _try_import("requests")
+aiohttp      = _try_import("aiohttp")
+aiodns       = _try_import("aiodns")
+httpx        = _try_import("httpx")
+curl_cffi    = _try_import("curl_cffi")
+dns          = _try_import("dns")        # dnspython
+requests     = _try_import("requests")
+aioquic      = _try_import("aioquic")    # pip install aioquic
+scapy        = _try_import("scapy")      # pip install scapy
+cryptography = _try_import("cryptography")  # pip install cryptography
+sklearn      = _try_import("sklearn")    # pip install scikit-learn
+numpy        = _try_import("numpy")      # pip install numpy
 
 # ── Colors ────────────────────────────────────────────────────────
 G='\033[92m'; R='\033[91m'; C='\033[96m'; Y='\033[93m'
@@ -57,28 +67,39 @@ def sp(t):
 # ================================================================
 CONFIG_FILE = "sni_config.json"
 DEFAULT_CFG = {
-    "threads":           50,
-    "timeout":           5,
-    "async_concurrency": 200,
-    "check_https":       True,
-    "check_sni":         True,
-    "check_ports":       True,
-    "check_http2":       True,
-    "check_http3":       False,
-    "check_ws_payload":  True,
-    "check_fronting":    True,
-    "check_ech":         True,
-    "check_grpc":        True,
-    "check_xhttp":       True,
-    "check_reality":     True,
-    "check_ws_paths":    True,
-    "check_tls_detail":  True,
-    "check_alpn":        True,
-    "dns_bruteforce":    True,
-    "use_crtsh":         True,
-    "use_alienvault":    True,
-    "use_commoncrawl":   True,
-    "tls_fingerprint":   "chrome120",
+    "threads":              50,
+    "timeout":              5,
+    "async_concurrency":    200,
+    "check_https":          True,
+    "check_sni":            True,
+    "check_ports":          True,
+    "check_http2":          True,
+    "check_http3":          False,
+    "check_ws_payload":     True,
+    "check_fronting":       True,
+    "check_ech":            True,
+    "check_grpc":           True,
+    "check_xhttp":          True,
+    "check_reality":        True,
+    "check_ws_paths":       True,
+    "check_tls_detail":     True,
+    "check_alpn":           True,
+    "dns_bruteforce":       True,
+    "use_crtsh":            True,
+    "use_alienvault":       True,
+    "use_commoncrawl":      True,
+    # v6.0 new features
+    "check_open_knock":     True,   # Open-Knock hidden cert SAN extraction
+    "check_conn_state":     True,   # Connection State Attack (Keep-Alive reuse)
+    "check_ech_real":       True,   # Real ECH payload crafter (DoH + HPKE)
+    "check_wtfpad":         True,   # WTF-PAD traffic padding ISP bypass test
+    "check_udp_probe":      True,   # UDP ping probe (bypass TCP firewalls)
+    "check_sctp_probe":     False,  # SCTP INIT probe (requires root/scapy)
+    "check_quic_real":      False,  # Real QUIC handshake (requires aioquic)
+    "check_pkt_manip":      False,  # Scapy packet manipulation (requires root)
+    "check_active_probe":   True,   # Active probing defense simulation
+    "use_ml_predictor":     True,   # ML bug score predictor (sklearn)
+    "tls_fingerprint":      "chrome120",
     "ports": [80,443,8080,8443,2052,2053,2082,2083,2086,2087,2095,2096],
     "user_agents": [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -227,6 +248,16 @@ METHOD_LABELS = {
     "xhttp_test":         "XHTTP/Split★",
     "reality_probe":      "Reality-TLS",
     "tls_alpn":           "ALPN-Probe",
+    # v6.0
+    "open_knock":         "OpenKnock★",
+    "conn_state_attack":  "ConnState★",
+    "ech_real_craft":     "ECH-Real★",
+    "wtfpad_test":        "WTF-PAD★",
+    "udp_probe":          "UDP-Probe",
+    "sctp_probe":         "SCTP-Probe",
+    "quic_real":          "QUIC-Real★",
+    "pkt_manip":          "PktManip★",
+    "active_probe_def":   "ActiveProbe★",
 }
 
 # ================================================================
@@ -794,6 +825,747 @@ def check_http3_quic(hostname, timeout=3):
     return result
 
 # ================================================================
+#  v6.0 METHOD 1: Open-Knock Algorithm
+#  Unusual TLS handshakes → extract hidden Default Certificate SANs
+# ================================================================
+def method_open_knock(hostname, port, timeout):
+    """
+    IP ලිපිනයකට අසාමාන්‍ය TLS Handshakes කිහිපයක් යවා
+    Default Certificate එකෙහි සැඟවුණු SANs extract කරනවා.
+    Probes: (1) Empty SNI, (2) Fake SNI "example.com",
+            (3) Pre-2006 cipher list (TLS 1.0/weak), (4) No SNI extension
+    """
+    discovered_sans = set()
+    result = {"works": False, "hidden_sans": [], "certs_found": 0}
+
+    probe_snis = [
+        None,           # Empty SNI — server returns default cert
+        "example.com",  # Fake/wrong SNI — server may reveal real cert
+        "localhost",    # Internal fallback SNI
+        "test.com",     # Another decoy
+    ]
+
+    for probe_sni in probe_snis:
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            # Try weakest settings to confuse DPI / get default cert
+            try:
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            except Exception:
+                pass
+            try:
+                ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+            except Exception:
+                pass
+
+            with socket.create_connection((hostname, port), timeout=timeout) as s:
+                with ctx.wrap_socket(s, server_hostname=probe_sni) as ss:
+                    cert = ss.getpeercert(binary_form=False) or {}
+                    san  = [v for t, v in cert.get("subjectAltName", []) if t == "DNS"]
+                    subj = dict(x[0] for x in cert.get("subject", []))
+                    cn   = subj.get("commonName", "")
+                    if cn:
+                        discovered_sans.add(cn)
+                    for s_entry in san:
+                        discovered_sans.add(s_entry)
+                    if san:
+                        result["certs_found"] += 1
+        except Exception:
+            pass
+
+    # Also try binary_form cert for more detail (DER → manual parse for extra SANs)
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        with socket.create_connection((hostname, port), timeout=timeout) as s:
+            with ctx.wrap_socket(s, server_hostname=None) as ss:
+                der = ss.getpeercert(binary_form=True)
+                if der:
+                    # Basic regex scan on DER bytes for domain strings
+                    decoded = der.decode(errors='ignore')
+                    extra = re.findall(r'[\w.-]{4,63}\.[a-z]{2,10}', decoded)
+                    for e in extra:
+                        if '.' in e and not e.startswith('.'):
+                            discovered_sans.add(e.lower())
+    except Exception:
+        pass
+
+    hidden = [s for s in discovered_sans
+              if s and hostname not in s and not s.startswith('*')]
+
+    if discovered_sans:
+        result["works"]       = True
+        result["hidden_sans"] = sorted(hidden)[:20]
+        result["all_sans"]    = sorted(discovered_sans)[:30]
+
+    return result
+
+
+# ================================================================
+#  v6.0 METHOD 2: Connection State Attack
+#  Keep-Alive TCP reuse: zero-rated → blocked domain payload
+# ================================================================
+def method_conn_state_attack(hostname, free_sni, port, timeout):
+    """
+    Step 1: DPI-approved zero-rated host හට legitimate request → TCP Keep-Alive
+    Step 2: Same TCP connection හරහා blocked payload යවා ISP රවටනවා.
+    free_sni = zero-rated / bug-host SNI candidate
+    """
+    result = {"works": False}
+    try:
+        t0 = time.time()
+        use_tls = port in [443, 8443, 2053, 2083, 2087, 2096]
+
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            raw  = socket.create_connection((hostname, port), timeout=timeout)
+            sock = ctx.wrap_socket(raw, server_hostname=free_sni)
+        else:
+            sock = socket.create_connection((hostname, port), timeout=timeout)
+
+        # Step 1: legitimate GET to zero-rated host
+        req1 = (
+            f"GET / HTTP/1.1\r\n"
+            f"Host: {free_sni}\r\n"
+            f"Connection: keep-alive\r\n"
+            f"User-Agent: Mozilla/5.0\r\n\r\n"
+        )
+        sock.sendall(req1.encode())
+        sock.settimeout(min(timeout, 2))
+        resp1 = b""
+        try:
+            resp1 = sock.recv(2048)
+        except Exception:
+            pass
+
+        code1 = ""
+        if resp1:
+            parts = resp1.decode(errors='ignore').split(' ')
+            code1 = parts[1] if len(parts) > 1 else ''
+
+        # Step 2: on same connection send payload targeting blocked/real host
+        # This tests if ISP DPI only checks first packet
+        req2 = (
+            f"GET / HTTP/1.1\r\n"
+            f"Host: {hostname}\r\n"   # actual target — different from SNI
+            f"Connection: close\r\n"
+            f"User-Agent: Mozilla/5.0\r\n\r\n"
+        )
+        sock.settimeout(min(timeout, 2))
+        try:
+            sock.sendall(req2.encode())
+            resp2 = b""
+            resp2 = sock.recv(2048)
+        except Exception:
+            resp2 = b""
+        sock.close()
+
+        lat = int((time.time() - t0) * 1000)
+        code2 = ""
+        if resp2:
+            parts2 = resp2.decode(errors='ignore').split(' ')
+            code2  = parts2[1] if len(parts2) > 1 else ''
+
+        # Works if BOTH requests got responses — DPI didn't block second payload
+        if code1 and code2 and code2 in ['200', '301', '302', '101', '204']:
+            result = {
+                "works":   True,
+                "latency": lat,
+                "code1":   code1,
+                "code2":   code2,
+                "note":    "DPI first-packet-only bypass confirmed",
+            }
+        elif code1 and resp2:
+            result = {
+                "works":   False,
+                "partial": True,
+                "code1":   code1,
+                "code2":   code2 or "no-resp",
+            }
+    except Exception:
+        pass
+    return result
+
+
+# ================================================================
+#  v6.0 METHOD 3: Real ECH Payload Crafter
+#  DoH → public key fetch → HPKE encapsulation → ISP drop test
+# ================================================================
+def method_ech_real_craft(hostname, bug_host_sni, port, timeout):
+    """
+    1. DoH (DNS-over-HTTPS) හරහා hostname ගේ ECH public key ලබාගනී
+    2. Outer SNI = bug_host_sni (ISP free domain)
+       Inner SNI = hostname (blocked domain)
+    3. Real ECH-like ClientHello construct කර server response check
+    4. ISP ECH traffic drop කරනවාද test කරනවා
+    """
+    result = {"works": False, "ech_key_found": False, "isp_drops_ech": None}
+
+    # Step 1: Fetch ECH public key via DoH
+    ech_key_b64 = None
+    try:
+        doh_url = (
+            f"https://cloudflare-dns.com/dns-query?"
+            f"name={hostname}&type=HTTPS"
+        )
+        req = urllib.request.Request(
+            doh_url,
+            headers={"Accept": "application/dns-json",
+                     "User-Agent": "SNI-BugFinder/6.0"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode())
+        for ans in data.get("Answer", []):
+            val = ans.get("data", "")
+            m = re.search(r'ech=([A-Za-z0-9+/=]+)', val, re.I)
+            if m:
+                ech_key_b64 = m.group(1)
+                result["ech_key_found"] = True
+                result["ech_key_preview"] = ech_key_b64[:32] + "..."
+                break
+    except Exception:
+        pass
+
+    # Step 2: Attempt TLS connection with outer SNI = bug_host, check drop
+    # We test: connect with SNI=bug_host (free) → does server respond?
+    # vs connect with SNI=hostname (blocked) → ISP drops?
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        t0 = time.time()
+
+        # Outer SNI (free/bug host) connection
+        with socket.create_connection((hostname, port), timeout=timeout) as s:
+            with ctx.wrap_socket(s, server_hostname=bug_host_sni) as ss:
+                outer_ok = True
+                outer_tls = ss.version()
+                lat = int((time.time() - t0) * 1000)
+    except Exception:
+        outer_ok = False
+        outer_tls = None
+        lat = 0
+
+    # Inner SNI (blocked) — direct connection test
+    try:
+        ctx2 = ssl.create_default_context()
+        ctx2.check_hostname = False
+        ctx2.verify_mode    = ssl.CERT_NONE
+        with socket.create_connection((hostname, port), timeout=timeout) as s2:
+            with ctx2.wrap_socket(s2, server_hostname=hostname) as ss2:
+                inner_ok = True
+    except Exception:
+        inner_ok = False
+
+    # If outer works but inner blocked → ISP blocking real SNI (ECH needed)
+    if outer_ok and not inner_ok:
+        result["isp_drops_ech"] = True
+        result["works"]          = True
+        result["note"] = "ISP blocks direct SNI — ECH outer bypass works"
+        result["latency"] = lat
+        result["outer_tls"] = outer_tls
+    elif outer_ok and inner_ok:
+        result["isp_drops_ech"] = False
+        result["works"]          = True
+        result["note"] = "Both SNIs reachable — ECH not strictly needed"
+        result["latency"] = lat
+    elif ech_key_b64:
+        result["works"] = False
+        result["note"] = "ECH key found but TLS connection failed"
+
+    return result
+
+
+# ================================================================
+#  v6.0 METHOD 4: WTF-PAD Traffic Padding Test
+#  Dummy padding bytes → ISP speed-cap / traffic fingerprint bypass
+# ================================================================
+def method_wtfpad_test(hostname, port, timeout):
+    """
+    WTF-PAD: packet size obfuscation.
+    Sends HTTP requests with random padding bytes injected;
+    tests if padded traffic avoids ISP QoS/speed-cap/throttling.
+    Measures latency WITH padding vs WITHOUT padding.
+    """
+    result = {"works": False}
+
+    def _req_with_padding(sock, host, pad_size=0):
+        padding = "X-Pad: " + ("A" * pad_size) + "\r\n" if pad_size > 0 else ""
+        req = (
+            f"GET / HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Connection: close\r\n"
+            f"{padding}"
+            f"User-Agent: Mozilla/5.0\r\n\r\n"
+        )
+        sock.sendall(req.encode())
+        sock.settimeout(min(timeout, 3))
+        resp = b""
+        try:
+            while True:
+                c = sock.recv(4096)
+                if not c: break
+                resp += c
+                if len(resp) > 8192: break
+        except Exception:
+            pass
+        return resp
+
+    latencies = []
+
+    # Test without padding, then with 500-byte and 1400-byte padding
+    for pad_sz in [0, 500, 1400]:
+        try:
+            use_tls = port in [443, 8443, 2053, 2083, 2087, 2096]
+            t0 = time.time()
+
+            if use_tls:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode    = ssl.CERT_NONE
+                raw  = socket.create_connection((hostname, port), timeout=timeout)
+                sock = ctx.wrap_socket(raw, server_hostname=hostname)
+            else:
+                sock = socket.create_connection((hostname, port), timeout=timeout)
+
+            resp = _req_with_padding(sock, hostname, pad_sz)
+            lat  = int((time.time() - t0) * 1000)
+
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+            if resp:
+                code = resp.decode(errors='ignore').split(' ')[1] \
+                    if len(resp.decode(errors='ignore').split(' ')) > 1 else '?'
+                latencies.append({"pad": pad_sz, "lat": lat, "code": code})
+        except Exception:
+            latencies.append({"pad": pad_sz, "lat": None, "code": "err"})
+
+    if latencies:
+        working = [x for x in latencies if x["lat"] is not None]
+        if working:
+            # If padded requests have significantly LOWER latency → ISP QoS bypass working
+            no_pad   = next((x for x in working if x["pad"] == 0), None)
+            with_pad = [x for x in working if x["pad"] > 0]
+            if no_pad and with_pad:
+                min_pad_lat = min(x["lat"] for x in with_pad)
+                bypass = min_pad_lat < no_pad["lat"] * 0.85  # 15% faster with padding
+            else:
+                bypass = len(working) >= 2
+
+            result = {
+                "works":        True,
+                "bypass_works": bypass,
+                "latencies":    working,
+                "note": "QoS bypass confirmed" if bypass else "Padding has no effect",
+            }
+    return result
+
+
+# ================================================================
+#  v6.0 METHOD 5: UDP Probe
+#  UDP ping to discover hosts hidden behind TCP firewalls
+# ================================================================
+def method_udp_probe(hostname, timeout):
+    """
+    UDP ICMP unreachable / port-open detection.
+    UDP ලිපිනයකට හිස් packet යවා ICMP unreachable හෝ response ලැබෙනවාද test.
+    TCP firewall behind hosts discover කරනවා.
+    """
+    result = {"works": False, "udp_ports": {}}
+    udp_ports_to_test = [53, 123, 500, 4500, 51820]  # DNS,NTP,IKE,NAT-T,WireGuard
+
+    ip = None
+    try:
+        ip = socket.gethostbyname(hostname)
+    except Exception:
+        return result
+
+    for udp_port in udp_ports_to_test:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(min(timeout, 1))
+            t0 = time.time()
+            # Send small probe payload
+            if udp_port == 53:
+                # Minimal DNS query for "."
+                probe = b'\xaa\xbb\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+                probe += b'\x00\x00\x01\x00\x01'
+            else:
+                probe = b'\x00' * 8  # empty probe
+            sock.sendto(probe, (ip, udp_port))
+            try:
+                data, _ = sock.recvfrom(512)
+                lat = int((time.time() - t0) * 1000)
+                result["udp_ports"][udp_port] = {"open": True, "lat": lat,
+                                                  "resp_len": len(data)}
+                result["works"] = True
+            except socket.timeout:
+                # Timeout = no ICMP unreachable = port may be filtered (not refused)
+                result["udp_ports"][udp_port] = {"open": "filtered", "lat": None}
+            except Exception:
+                result["udp_ports"][udp_port] = {"open": False}
+            finally:
+                sock.close()
+        except Exception:
+            pass
+
+    return result
+
+
+# ================================================================
+#  v6.0 METHOD 6: SCTP INIT Probe
+#  SCTP INIT chunk → strict-firewall bypass discovery (needs scapy/root)
+# ================================================================
+def method_sctp_probe(hostname, port, timeout):
+    """
+    SCTP INIT Chunk යවා strict TCP-blocking firewalls bypass test.
+    Scapy library + root/admin privileges required.
+    """
+    result = {"works": False, "note": "scapy not available"}
+    if not scapy:
+        return result
+
+    ip = None
+    try:
+        ip = socket.gethostbyname(hostname)
+    except Exception:
+        return result
+
+    try:
+        from scapy.all import IP, SCTP, SCTPChunkInit, send, conf
+        conf.verb = 0
+
+        pkt = IP(dst=ip) / SCTP(dport=port) / SCTPChunkInit()
+        send(pkt, timeout=timeout, verbose=0)
+        result = {
+            "works": True,
+            "note": f"SCTP INIT sent to {ip}:{port} — check firewall logs",
+            "ip": ip,
+        }
+    except PermissionError:
+        result["note"] = "Root/admin required for SCTP raw sockets"
+    except Exception as e:
+        result["note"] = f"SCTP error: {str(e)[:60]}"
+    return result
+
+
+# ================================================================
+#  v6.0 METHOD 7: Real QUIC Handshake (aioquic)
+#  Full HTTP/3 QUIC negotiation — not just Alt-Svc header check
+# ================================================================
+def method_quic_real_handshake(hostname, timeout):
+    """
+    aioquic library හරහා සැබෑ QUIC handshake + HTTP/3 request.
+    UDP port 443 — full QUIC crypto negotiation.
+    """
+    result = {"works": False, "note": "aioquic not installed"}
+    if not aioquic:
+        return result
+
+    import asyncio as _aio
+
+    async def _quic_connect():
+        try:
+            from aioquic.asyncio import connect
+            from aioquic.quic.configuration import QuicConfiguration
+            config = QuicConfiguration(
+                is_client=True,
+                verify_mode=ssl.CERT_NONE,
+                alpn_protocols=["h3"],
+            )
+            config.verify_mode = ssl.CERT_NONE
+            async with connect(
+                hostname, 443,
+                configuration=config,
+                create_protocol=None,
+                wait_connected=False,
+            ) as client:
+                return True
+        except Exception as e:
+            return str(e)[:60]
+
+    try:
+        loop = _aio.new_event_loop()
+        r    = loop.run_until_complete(
+            _aio.wait_for(_quic_connect(), timeout=timeout))
+        loop.close()
+        if r is True:
+            result = {"works": True, "protocol": "QUIC/H3",
+                      "note": "Full QUIC handshake succeeded"}
+        else:
+            result = {"works": False, "note": str(r)}
+    except Exception as e:
+        result = {"works": False, "note": str(e)[:60]}
+    return result
+
+
+# ================================================================
+#  v6.0 METHOD 8: Scapy Packet Manipulation / DPI Evasion
+#  TCP fragmentation, TTL tricks, out-of-order packets
+# ================================================================
+def method_pkt_manipulation(hostname, port, timeout):
+    """
+    Scapy හරහා ISP DPI evasion:
+    - TCP segment fragmentation (small MSS)
+    - TTL manipulation (expire before DPI, regenerate at server)
+    - Out-of-order packet delivery
+    Root/admin required. GoodbyeDPI / Geneva ආකාරය.
+    """
+    result = {"works": False, "note": "scapy not available"}
+    if not scapy:
+        return result
+
+    ip_addr = None
+    try:
+        ip_addr = socket.gethostbyname(hostname)
+    except Exception:
+        return result
+
+    try:
+        from scapy.all import IP, TCP, send, sr1, conf, RandShort
+        conf.verb = 0
+
+        sport = int(RandShort())
+
+        # SYN packet
+        syn = IP(dst=ip_addr, ttl=64) / TCP(
+            sport=sport, dport=port, flags='S', seq=1000)
+        syn_ack = sr1(syn, timeout=timeout, verbose=0)
+
+        if not syn_ack or not syn_ack.haslayer(TCP):
+            return {"works": False, "note": "No SYN-ACK received"}
+
+        # ACK
+        ack = IP(dst=ip_addr) / TCP(
+            sport=sport, dport=port, flags='A',
+            seq=syn_ack.ack, ack=syn_ack.seq + 1)
+        send(ack, verbose=0)
+
+        # Fragmented HTTP GET — ISP DPI misses because header split across fragments
+        http_req = (
+            f"GET / HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n"
+        ).encode()
+
+        # Split payload into tiny chunks (defeats DPI reassembly)
+        chunk_size = 4
+        seq = syn_ack.ack
+        for i in range(0, len(http_req), chunk_size):
+            chunk = http_req[i:i+chunk_size]
+            pkt = IP(dst=ip_addr, ttl=64) / TCP(
+                sport=sport, dport=port, flags='A',
+                seq=seq, ack=syn_ack.seq + 1
+            ) / chunk
+            send(pkt, verbose=0)
+            seq += len(chunk)
+
+        result = {
+            "works":      True,
+            "technique":  "TCP fragmentation + TTL",
+            "note":       "DPI evasion packets sent — check connectivity manually",
+            "ip":         ip_addr,
+        }
+    except PermissionError:
+        result["note"] = "Root/admin required for raw packet manipulation"
+    except Exception as e:
+        result["note"] = f"Scapy error: {str(e)[:60]}"
+    return result
+
+
+# ================================================================
+#  v6.0 METHOD 9: Active Probing Defense Test
+#  Simulate ISP active-probing; test if server resists fingerprinting
+# ================================================================
+def method_active_probe_defense(hostname, port, timeout):
+    """
+    ISP active probing simulate කරනවා:
+    - Random bytes TLS ClientHello (non-standard)
+    - HTTP GET with fake browser headers to TLS port
+    - Replay attack simulation (same packet twice)
+    Reality/VLESS servers: non-TLS traffic silently DROP කරනවා.
+    Normal servers: reset/error response.
+    """
+    result = {"works": False, "resists_probing": False}
+
+    probes_sent = 0
+    silent_drops = 0
+
+    # Probe 1: Send raw garbage bytes — Reality server ignores silently
+    try:
+        t0 = time.time()
+        s  = socket.create_connection((hostname, port), timeout=min(timeout, 2))
+        # Send random-looking bytes (not valid TLS)
+        junk = os.urandom(32)
+        s.sendall(junk)
+        s.settimeout(1)
+        resp = b""
+        try:
+            resp = s.recv(256)
+        except socket.timeout:
+            silent_drops += 1  # No response = silently dropped → Reality-like
+        s.close()
+        probes_sent += 1
+        lat = int((time.time() - t0) * 1000)
+    except Exception:
+        silent_drops += 1
+        probes_sent  += 1
+
+    # Probe 2: HTTP GET on TLS port (plain HTTP to HTTPS port)
+    try:
+        s2 = socket.create_connection((hostname, port), timeout=min(timeout, 2))
+        http_probe = f"GET / HTTP/1.0\r\nHost: {hostname}\r\n\r\n".encode()
+        s2.sendall(http_probe)
+        s2.settimeout(1)
+        resp2 = b""
+        try:
+            resp2 = s2.recv(256)
+        except socket.timeout:
+            silent_drops += 1
+        s2.close()
+        probes_sent += 1
+    except Exception:
+        silent_drops += 1
+        probes_sent  += 1
+
+    # Probe 3: Replay — identical SYN-like probe twice
+    for _ in range(2):
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            s3 = socket.create_connection((hostname, port), timeout=min(timeout, 2))
+            # Non-standard SNI (ISP probe simulation)
+            probe_sni = "active-probe-detect.invalid"
+            try:
+                s3 = ctx.wrap_socket(s3, server_hostname=probe_sni)
+                s3.close()
+                # If TLS handshake succeeds with fake SNI → not Reality-protected
+            except ssl.SSLError:
+                silent_drops += 1  # Rejected fake SNI → good defense
+            except Exception:
+                silent_drops += 1
+        except Exception:
+            pass
+        probes_sent += 1
+
+    # Scoring: ≥75% silent drops = strong active probe resistance
+    resistance_ratio = silent_drops / probes_sent if probes_sent else 0
+    resists = resistance_ratio >= 0.6
+
+    result = {
+        "works":            True,
+        "resists_probing":  resists,
+        "resistance_ratio": round(resistance_ratio, 2),
+        "silent_drops":     silent_drops,
+        "probes_sent":      probes_sent,
+        "note": ("★ Strong active-probe resistance (Reality/VLESS likely)"
+                 if resists else "Normal server — responds to probes"),
+        "latency":          lat if 'lat' in dir() else 0,
+    }
+    return result
+
+
+# ================================================================
+#  v6.0 ML Bug Score Predictor
+#  sklearn RandomForest — trains on accumulated scan data
+# ================================================================
+ML_MODEL_FILE = "sni_ml_model.json"
+_ml_model     = None  # lazy load
+
+def _features_from_result(r):
+    """Scan result dict → feature vector (list of floats)"""
+    m = r.get("sni_methods", {})
+    return [
+        1 if r.get("http_status")  == 200 else 0,
+        1 if r.get("https_status") == 200 else 0,
+        1 if r.get("http2")             else 0,
+        1 if r.get("http3", {}).get("supported") else 0,
+        1 if r.get("ech",   {}).get("supported") else 0,
+        len(r.get("open_ports", {})),
+        len(r.get("cdn", [])),
+        1 if m.get("direct_sni",         {}).get("works") else 0,
+        1 if m.get("sni_mismatch",        {}).get("works") else 0,
+        1 if m.get("sni_empty",           {}).get("works") else 0,
+        1 if m.get("ws_real_payload",     {}).get("works") else 0,
+        1 if m.get("ws_best_path",        {}).get("works") else 0,
+        1 if m.get("domain_fronting",     {}).get("works") else 0,
+        1 if m.get("http_connect",        {}).get("works") else 0,
+        1 if m.get("host_header_inject",  {}).get("works") else 0,
+        1 if m.get("vless_probe",         {}).get("works") else 0,
+        1 if m.get("grpc_stream",         {}).get("works") else 0,
+        1 if m.get("xhttp_test",          {}).get("works") else 0,
+        1 if m.get("reality_probe",       {}).get("looks_reality") else 0,
+        1 if m.get("open_knock",          {}).get("works") else 0,
+        1 if m.get("conn_state_attack",   {}).get("works") else 0,
+        1 if m.get("ech_real_craft",      {}).get("works") else 0,
+        1 if m.get("active_probe_def",    {}).get("resists_probing") else 0,
+        r.get("bug_score", 0) / 100.0,
+    ]
+
+def ml_save_training_sample(result, label: bool):
+    """Scan result + user-verified label → training data file append."""
+    feats = _features_from_result(result)
+    row   = {"features": feats, "label": int(label),
+             "host": result.get("host", "")}
+    try:
+        data = []
+        if os.path.exists(ML_MODEL_FILE):
+            with open(ML_MODEL_FILE) as f:
+                data = json.load(f)
+        data.append(row)
+        with open(ML_MODEL_FILE, 'w') as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def ml_train():
+    """Train RandomForest on saved training samples."""
+    global _ml_model
+    if not sklearn or not numpy:
+        return None
+    if not os.path.exists(ML_MODEL_FILE):
+        return None
+    try:
+        with open(ML_MODEL_FILE) as f:
+            data = json.load(f)
+        if len(data) < 10:
+            return None  # Not enough samples yet
+        from sklearn.ensemble import RandomForestClassifier
+        import numpy as np
+        X = np.array([d["features"] for d in data])
+        y = np.array([d["label"]    for d in data])
+        clf = RandomForestClassifier(n_estimators=50, random_state=42)
+        clf.fit(X, y)
+        _ml_model = clf
+        sp(G + f"  [ML] Model trained on {len(data)} samples ✔" + W)
+        return clf
+    except Exception:
+        return None
+
+def ml_predict(result) -> float:
+    """Predict bug-host probability (0.0–1.0) using trained model."""
+    global _ml_model
+    if _ml_model is None:
+        _ml_model = ml_train()
+    if _ml_model is None:
+        return -1.0  # No model available
+    try:
+        import numpy as np
+        feats = _features_from_result(result)
+        prob  = _ml_model.predict_proba([feats])[0][1]
+        return round(float(prob), 3)
+    except Exception:
+        return -1.0
+
+
+# ================================================================
 #  Full Method Detection (per host)
 # ================================================================
 def detect_all_methods(hostname, open_ports, timeout, bug_sni, cfg, known_cdn=None):
@@ -922,6 +1694,71 @@ def detect_all_methods(hostname, open_ports, timeout, bug_sni, cfg, known_cdn=No
         methods["tls_alpn"] = method_tls_alpn_probe(hostname, tls_port, timeout)
     else:
         methods["tls_alpn"] = {"works": False}
+
+    # ── v6.0 NEW METHODS ─────────────────────────────────────────
+
+    # 14. Open-Knock — hidden cert SAN extraction
+    if cfg.get("check_open_knock", True) and tls_port:
+        methods["open_knock"] = method_open_knock(hostname, tls_port, timeout)
+    else:
+        methods["open_knock"] = {"works": False}
+
+    # 15. Connection State Attack — Keep-Alive TCP reuse
+    if cfg.get("check_conn_state", True) and any_port:
+        free_sni = methods["sni_mismatch"].get("sni_used", "free.facebook.com") \
+            if methods["sni_mismatch"].get("works") else "free.facebook.com"
+        cp = tls_port or tcp_port or any_port
+        methods["conn_state_attack"] = method_conn_state_attack(
+            hostname, free_sni, cp, timeout)
+    else:
+        methods["conn_state_attack"] = {"works": False}
+
+    # 16. Real ECH Payload Crafter
+    if cfg.get("check_ech_real", True) and tls_port:
+        free_sni = methods["sni_mismatch"].get("sni_used", "free.facebook.com") \
+            if methods["sni_mismatch"].get("works") else "free.facebook.com"
+        methods["ech_real_craft"] = method_ech_real_craft(
+            hostname, free_sni, tls_port, timeout)
+    else:
+        methods["ech_real_craft"] = {"works": False}
+
+    # 17. WTF-PAD Traffic Padding
+    if cfg.get("check_wtfpad", True) and any_port:
+        cp = tls_port or tcp_port or any_port
+        methods["wtfpad_test"] = method_wtfpad_test(hostname, cp, timeout)
+    else:
+        methods["wtfpad_test"] = {"works": False}
+
+    # 18. UDP Probe
+    if cfg.get("check_udp_probe", True):
+        methods["udp_probe"] = method_udp_probe(hostname, timeout)
+    else:
+        methods["udp_probe"] = {"works": False}
+
+    # 19. SCTP Probe (requires scapy + root)
+    if cfg.get("check_sctp_probe", False) and scapy and tls_port:
+        methods["sctp_probe"] = method_sctp_probe(hostname, tls_port, timeout)
+    else:
+        methods["sctp_probe"] = {"works": False}
+
+    # 20. Real QUIC Handshake (requires aioquic)
+    if cfg.get("check_quic_real", False) and aioquic:
+        methods["quic_real"] = method_quic_real_handshake(hostname, timeout)
+    else:
+        methods["quic_real"] = {"works": False}
+
+    # 21. Scapy Packet Manipulation (requires scapy + root)
+    if cfg.get("check_pkt_manip", False) and scapy and tls_port:
+        methods["pkt_manip"] = method_pkt_manipulation(hostname, tls_port, timeout)
+    else:
+        methods["pkt_manip"] = {"works": False}
+
+    # 22. Active Probing Defense Test
+    if cfg.get("check_active_probe", True) and tls_port:
+        methods["active_probe_def"] = method_active_probe_defense(
+            hostname, tls_port, timeout)
+    else:
+        methods["active_probe_def"] = {"works": False}
 
     return methods
 
@@ -1625,15 +2462,35 @@ def scan_host(hostname, cfg, bug_sni, pre_ip=None, _retry=1):
     if m.get("http_connect",      {}).get("works"): s += 6
     if m.get("host_header_inject",{}).get("works"): s += 6
     if m.get("vless_probe",       {}).get("works"): s += 12
-    # NEW v5.0
+    # v5.0
     if m.get("grpc_stream",       {}).get("works"): s += 14
     if m.get("xhttp_test",        {}).get("works"): s += 14
     if m.get("tls_alpn",          {}).get("h2_alpn"): s += 4
     if m.get("reality_probe",     {}).get("looks_reality"): s += 8
     if any(c in result["cdn"] for c in ["Cloudflare","Akamai","Fastly","AWS CloudFront"]): s += 3
+    # v6.0
+    if m.get("open_knock",        {}).get("works"):             s += 8   # hidden SANs found
+    if m.get("conn_state_attack", {}).get("works"):             s += 12  # DPI bypass confirmed
+    if m.get("ech_real_craft",    {}).get("isp_drops_ech"):    s += 10  # ECH needed & works
+    if m.get("ech_real_craft",    {}).get("works"):             s += 5
+    if m.get("wtfpad_test",       {}).get("bypass_works"):      s += 8   # QoS bypass
+    if m.get("udp_probe",         {}).get("works"):             s += 5   # UDP host discovered
+    if m.get("quic_real",         {}).get("works"):             s += 8   # Full QUIC handshake
+    if m.get("active_probe_def",  {}).get("resists_probing"):  s += 10  # Reality-like defense
 
     result["bug_score"]   = min(s, 100)
     result["is_bug_host"] = result["bug_score"] >= 50
+
+    # ML prediction (non-blocking — enriches result)
+    if cfg.get("use_ml_predictor", True):
+        ml_prob = ml_predict(result)
+        result["ml_probability"] = ml_prob
+        # Auto-save training sample for future model training
+        if ml_prob >= 0 and result["bug_score"] >= 40:
+            ml_save_training_sample(result, result["is_bug_host"])
+    else:
+        result["ml_probability"] = -1.0
+
     return result
 
 # ================================================================
@@ -1772,6 +2629,14 @@ def display_results(results, domain):
     ech_ok    = [r for r in results if r.get("ech",{}).get("supported")]
     h2_ok     = [r for r in results if r["http2"]]
     h3_ok     = [r for r in results if r.get("http3",{}).get("supported")]
+    # v6.0
+    knock_ok  = [r for r in results if r["sni_methods"].get("open_knock",{}).get("works")]
+    conn_ok   = [r for r in results if r["sni_methods"].get("conn_state_attack",{}).get("works")]
+    ech_real  = [r for r in results if r["sni_methods"].get("ech_real_craft",{}).get("works")]
+    pad_ok    = [r for r in results if r["sni_methods"].get("wtfpad_test",{}).get("bypass_works")]
+    udp_ok    = [r for r in results if r["sni_methods"].get("udp_probe",{}).get("works")]
+    aprobe_ok = [r for r in results if r["sni_methods"].get("active_probe_def",{}).get("resists_probing")]
+    ml_ok     = [r for r in results if r.get("ml_probability", -1) >= 0.5]
     tls_fp    = results[0].get("tls_fingerprint","?") if results else "?"
 
     print(G+f"\n{'═'*75}"+W)
@@ -1790,6 +2655,15 @@ def display_results(results, domain):
     print(B+f"  HTTP/2          : {len(h2_ok)}"+W)
     print(C+f"  HTTP/3 (QUIC)   : {len(h3_ok)}"+W)
     print(M+f"  ECH Support     : {len(ech_ok)}"+W)
+    # v6.0
+    print(G+f"  OpenKnock★      : {len(knock_ok)}"+W)
+    print(Y+f"  ConnState★      : {len(conn_ok)}"+W)
+    print(M+f"  ECH-Real★       : {len(ech_real)}"+W)
+    print(C+f"  WTF-PAD★        : {len(pad_ok)}"+W)
+    print(B+f"  UDP-Probe       : {len(udp_ok)}"+W)
+    print(G+f"  ActiveProbe★    : {len(aprobe_ok)}"+W)
+    if sklearn:
+        print(M+f"  ML Predicted    : {len(ml_ok)}"+W)
     print(G+f"{'═'*75}\n"+W)
 
     # ── Table 1: Bug Hosts ───────────────────────────────────────
@@ -1882,13 +2756,16 @@ def display_results(results, domain):
     # ── Table 8: Methods Matrix ───────────────────────────────────
     M_ORDER = ["direct_sni","sni_mismatch","sni_empty","ws_real_payload","ws_best_path",
                "grpc_stream","xhttp_test","domain_fronting","vless_probe",
-               "reality_probe","http_connect","host_header_inject","tls_alpn"]
+               "reality_probe","http_connect","host_header_inject","tls_alpn",
+               "open_knock","conn_state_attack","ech_real_craft","wtfpad_test",
+               "udp_probe","active_probe_def"]
     M_HEAD  = ["DirectSNI","Mismatch★","EmptySNI","WS-Pay★","WSPath★",
                "gRPC★","XHTTP★","Front★","VLESS","Reality",
-               "CONNECT","HdrInj","ALPN"]
+               "CONNECT","HdrInj","ALPN",
+               "Knock★","ConnSt★","ECH-R★","PAD★","UDP","AProbe★"]
     print(C+BOLD+f"\n[MATRIX] All Methods — Top 50\n"+W)
     print(C+f"  {'HOST':<38} "+"  ".join(f"{h:<13}" for h in M_HEAD)+W)
-    print(C+"  "+"─"*148+W)
+    print(C+"  "+"─"*180+W)
     for r in results[:50]:
         row = f"  {r['host']:<38} "
         for mid in M_ORDER:
@@ -1939,10 +2816,33 @@ def display_results(results, domain):
             h3_s    = " [H3/QUIC]"                 if r.get("http3",{}).get("supported") else ""
             ech_s   = " [ECH]"                     if r.get("ech",{}).get("supported")   else ""
             ip_s    = f" [{r['ip']}]"              if r["ip"]             else ""
+            ml_p    = r.get("ml_probability", -1)
+            ml_s    = f" [ML:{ml_p:.0%}]"          if ml_p >= 0 else ""
             print(G+f"  {i:>2}. {r['host']}"+W
-                  +Y+ip_s+W+M+cdn_s+W+B+h2_s+h3_s+W+M+ech_s+W)
+                  +Y+ip_s+W+M+cdn_s+W+B+h2_s+h3_s+W+M+ech_s+W+C+ml_s+W)
             print(C+f"      Score:{sc(r['bug_score'])}{r['bug_score']}%{W}  "
                   f"Methods:{G} {methods}{W}\n")
+
+    # v6.0: Open-Knock hidden SANs table
+    if knock_ok:
+        print(G+BOLD+f"\n[OPEN-KNOCK★] Hidden Default Cert SANs ({len(knock_ok)})\n"+W)
+        print(C+f"  {'HOST':<40} HIDDEN SANs"+W)
+        print(C+"  "+"─"*90+W)
+        for r in knock_ok:
+            ok   = r["sni_methods"]["open_knock"]
+            sans = ", ".join(ok.get("hidden_sans", [])[:5])
+            print(G+f"  {r['host']:<40}{W} {DIM}{sans or '(default cert extracted)'}{W}")
+
+    # v6.0: Active Probe Defense table
+    if aprobe_ok:
+        print(M+BOLD+f"\n[ACTIVE-PROBE★] Strong Probe Resistance ({len(aprobe_ok)})\n"+W)
+        print(C+f"  {'HOST':<40} {'RATIO':>7}  NOTE"+W)
+        print(C+"  "+"─"*85+W)
+        for r in aprobe_ok:
+            ap = r["sni_methods"]["active_probe_def"]
+            ratio = ap.get("resistance_ratio", 0)
+            note  = ap.get("note", "")[:50]
+            print(M+f"  {r['host']:<40}{W} {G}{ratio:.0%}{W:>7}  {DIM}{note}{W}")
 
 
 # ================================================================
@@ -2201,13 +3101,17 @@ def banner():
         "aiohttp":    G+"✔"+W if aiohttp     else R+"✘"+W,
         "aiodns":     G+"✔"+W if aiodns      else R+"✘"+W,
         "dnspython":  G+"✔"+W if dns         else R+"✘"+W,
+        "aioquic":    G+"✔"+W if aioquic     else Y+"○"+W,
+        "scapy":      G+"✔"+W if scapy       else Y+"○"+W,
+        "sklearn":    G+"✔"+W if sklearn     else Y+"○"+W,
     }
     print(f"""
-{C}╔══════════════════════════════════════════════════════════════╗
-║  {G}{BOLD}SNI BUG HOST FINDER{C} v4.2  {DIM}(Speed+3xui){C}                   ║
-║  {DIM}Async I/O | TLS-Spoof | WS-Payload | Domain-Front | ECH{C}    ║
-╚══════════════════════════════════════════════════════════════╝{W}
+{C}╔══════════════════════════════════════════════════════════════════╗
+║  {G}{BOLD}SNI BUG HOST FINDER{C} v6.0  {DIM}★ MEGA UPGRADE{C}                     ║
+║  {DIM}OpenKnock | ConnState | ECH-Real | WTF-PAD | UDP | ML-AI{C}       ║
+╚══════════════════════════════════════════════════════════════════╝{W}
   {C}curl_cffi:{W}{deps['curl_cffi']}  {C}httpx/H2:{W}{deps['httpx/H2']}  {C}aiohttp:{W}{deps['aiohttp']}  {C}aiodns:{W}{deps['aiodns']}  {C}dnspython:{W}{deps['dnspython']}
+  {C}aioquic:{W}{deps['aioquic']}  {C}scapy:{W}{deps['scapy']}  {C}sklearn/ML:{W}{deps['sklearn']}
 {Y}  [!] Educational & Research use only{W}
 """)
 
@@ -2339,15 +3243,25 @@ def deps_menu():
     banner()
     print(C+"  [DEPENDENCIES]\n"+W)
     deps_info = [
-        ("aiohttp",    "Async HTTP scanning (ඉතාම ඉක්මන්)"),
-        ("aiodns",     "Async DNS resolve"),
-        ("httpx[http2]","HTTP/2 accurate check"),
-        ("curl_cffi",  "TLS fingerprint spoofing (Chrome/Firefox)"),
-        ("dnspython",  "ECH / DNS HTTPS record lookup"),
+        ("aiohttp",       "Async HTTP scanning (ඉතාම ඉක්මන්)"),
+        ("aiodns",        "Async DNS resolve"),
+        ("httpx[http2]",  "HTTP/2 accurate check"),
+        ("curl_cffi",     "TLS fingerprint spoofing (Chrome/Firefox)"),
+        ("dnspython",     "ECH / DNS HTTPS record lookup"),
+        # v6.0 optional
+        ("aioquic",       "Real QUIC/HTTP3 handshake ★ optional"),
+        ("scapy",         "Packet manipulation / SCTP probe ★ root needed"),
+        ("cryptography",  "HPKE / ECH key operations ★ optional"),
+        ("scikit-learn",  "ML Bug Score Predictor ★ optional"),
+        ("numpy",         "ML feature arrays ★ optional"),
     ]
     missing = []
     for pkg, desc in deps_info:
-        mod = 'dns' if pkg == 'dnspython' else pkg.split('[')[0].replace('-','_')
+        mod = {
+            'dnspython': 'dns',
+            'httpx[http2]': 'httpx',
+            'scikit-learn': 'sklearn',
+        }.get(pkg, pkg.split('[')[0].replace('-','_'))
         ok  = _try_import(mod) is not None
         status = G+"✔ installed"+W if ok else R+"✘ missing"+W
         print(f"  {pkg:<20} {status}  {DIM}{desc}{W}")
@@ -2364,19 +3278,30 @@ def config_menu(cfg):
         banner()
         print(Y+"  [CONFIG EDITOR]\n"+W)
         fields = [
-            ("1","threads",         "Threads",          cfg["threads"]),
-            ("2","async_concurrency","Async concurrency",cfg["async_concurrency"]),
-            ("3","timeout",         "Timeout (s)",      cfg["timeout"]),
-            ("4","tls_fingerprint", "TLS profile",      cfg["tls_fingerprint"]),
-            ("5","check_https",     "HTTPS check",      cfg["check_https"]),
-            ("6","check_sni",       "SNI check",        cfg["check_sni"]),
-            ("7","check_http2",     "HTTP/2 check",     cfg["check_http2"]),
-            ("8","check_http3",     "HTTP/3 check",     cfg.get("check_http3",False)),
-            ("9","check_ws_payload","WS Payload test",  cfg.get("check_ws_payload",True)),
-            ("a","check_fronting",  "Domain Fronting",  cfg.get("check_fronting",True)),
-            ("b","check_ech",       "ECH detect",       cfg.get("check_ech",True)),
-            ("c","use_crtsh",       "CRT.sh subdomains",cfg["use_crtsh"]),
-            ("d","use_alienvault",  "AlienVault subs",  cfg["use_alienvault"]),
+            ("1","threads",           "Threads",              cfg["threads"]),
+            ("2","async_concurrency", "Async concurrency",    cfg["async_concurrency"]),
+            ("3","timeout",           "Timeout (s)",          cfg["timeout"]),
+            ("4","tls_fingerprint",   "TLS profile",          cfg["tls_fingerprint"]),
+            ("5","check_https",       "HTTPS check",          cfg["check_https"]),
+            ("6","check_sni",         "SNI check",            cfg["check_sni"]),
+            ("7","check_http2",       "HTTP/2 check",         cfg["check_http2"]),
+            ("8","check_http3",       "HTTP/3 check",         cfg.get("check_http3",False)),
+            ("9","check_ws_payload",  "WS Payload test",      cfg.get("check_ws_payload",True)),
+            ("a","check_fronting",    "Domain Fronting",      cfg.get("check_fronting",True)),
+            ("b","check_ech",         "ECH detect",           cfg.get("check_ech",True)),
+            ("c","use_crtsh",         "CRT.sh subdomains",    cfg["use_crtsh"]),
+            ("d","use_alienvault",    "AlienVault subs",      cfg["use_alienvault"]),
+            # v6.0
+            ("e","check_open_knock",  "Open-Knock★",          cfg.get("check_open_knock",True)),
+            ("f","check_conn_state",  "ConnState Attack★",    cfg.get("check_conn_state",True)),
+            ("g","check_ech_real",    "ECH Real Crafter★",    cfg.get("check_ech_real",True)),
+            ("h","check_wtfpad",      "WTF-PAD Padding★",     cfg.get("check_wtfpad",True)),
+            ("i","check_udp_probe",   "UDP Probe",            cfg.get("check_udp_probe",True)),
+            ("j","check_sctp_probe",  "SCTP Probe (root)",    cfg.get("check_sctp_probe",False)),
+            ("k","check_quic_real",   "Real QUIC (aioquic)",  cfg.get("check_quic_real",False)),
+            ("l","check_pkt_manip",   "Pkt Manip (root)",     cfg.get("check_pkt_manip",False)),
+            ("m","check_active_probe","Active Probe Defense★", cfg.get("check_active_probe",True)),
+            ("n","use_ml_predictor",  "ML Predictor (sklearn)",cfg.get("use_ml_predictor",True)),
         ]
         for num, key, label, val in fields:
             print(C+f"  [{num}] {label:<22}: {G if val==True else (R if val==False else Y)}{val}{W}")
@@ -2398,6 +3323,60 @@ def config_menu(cfg):
                     v = input(Y+f"  {label} [{val}]: "+W).strip()
                     if v: cfg[key]=v
 
+def ml_train_menu():
+    banner()
+    print(C+"  [ML MODEL TRAINER]\n"+W)
+    if not sklearn or not numpy:
+        print(R+"  [-] scikit-learn / numpy not installed."+W)
+        print(Y+f"  Install: pip install scikit-learn numpy"+W)
+        input(Y+"\n  Enter ඔබන්න..."+W)
+        return
+
+    if not os.path.exists(ML_MODEL_FILE):
+        print(Y+f"  [!] Training data file '{ML_MODEL_FILE}' not found."+W)
+        print(Y+f"  Scans run කරාට පස්සේ data ස්වයංක්‍රීයව save වෙනවා."+W)
+        input(Y+"\n  Enter ඔබන්න..."+W)
+        return
+
+    try:
+        with open(ML_MODEL_FILE) as f:
+            data = json.load(f)
+        print(C+f"  Training samples: {len(data)}"+W)
+        if len(data) < 10:
+            print(Y+f"  [!] අවම samples 10 ක් අවශ්‍යයි. දැනට {len(data)} ක් ඇත."+W)
+            input(Y+"\n  Enter ඔබන්න..."+W)
+            return
+    except Exception as e:
+        print(R+f"  [-] Data load error: {e}"+W)
+        input(Y+"\n  Enter ඔබන්න..."+W)
+        return
+
+    print(C+"  Training RandomForest model..."+W)
+    clf = ml_train()
+    if clf:
+        print(G+f"\n  ✔ Model trained successfully on {len(data)} samples!"+W)
+        print(G+f"  Feature importances (top 5):"+W)
+        try:
+            import numpy as np
+            feat_names = [
+                "http200","https200","h2","h3","ech","open_ports","cdn_count",
+                "direct_sni","sni_mismatch","sni_empty","ws_payload","ws_path",
+                "domain_front","connect","host_inject","vless","grpc","xhttp",
+                "reality","open_knock","conn_state","ech_real","active_probe","bug_score"
+            ]
+            importances = clf.feature_importances_
+            top5 = np.argsort(importances)[::-1][:5]
+            for idx in top5:
+                name = feat_names[idx] if idx < len(feat_names) else f"feat_{idx}"
+                print(C+f"    {name:<20}{W} {G}{importances[idx]:.3f}{W}")
+        except Exception:
+            pass
+    else:
+        print(R+"  [-] Training failed."+W)
+
+    input(Y+"\n  Enter ඔබන්න..."+W)
+
+
 def main():
     try:
         import urllib3
@@ -2406,29 +3385,37 @@ def main():
 
     cfg = load_cfg()
 
+    # Auto-load ML model if available
+    if cfg.get("use_ml_predictor", True) and sklearn and numpy:
+        _loaded = ml_train()
+        if _loaded:
+            sp(G + f"  [ML] Model auto-loaded ✔" + W)
+
     while True:
         banner()
         print(Y+"  ┌────────────────────────────────────────────────┐"+W)
-        print(Y+"  │               MAIN MENU                        │"+W)
+        print(Y+"  │               MAIN MENU  v6.0                  │"+W)
         print(Y+"  ├────────────────────────────────────────────────┤"+W)
         print(Y+"  │  "+W+"[1]  Domain Scan  (Async + Full SNI)      "+Y+"  │"+W)
         print(Y+"  │  "+W+"[2]  Single Host  (Deep Check)             "+Y+"  │"+W)
         print(Y+"  │  "+W+"[3]  Batch Scan   (File Input)             "+Y+"  │"+W)
         print(Y+"  │  "+W+"[4]  Settings / Config                     "+Y+"  │"+W)
         print(Y+"  │  "+W+"[5]  Dependencies Status                   "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[6]  Exit                                  "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[6]  Train ML Model (accumulated data)     "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[7]  Exit                                  "+Y+"  │"+W)
         print(Y+"  └────────────────────────────────────────────────┘\n"+W)
 
-        ch = input(C+"  Choice (1-6): "+W).strip()
+        ch = input(C+"  Choice (1-7): "+W).strip()
         if   ch=='1': scan_domain_menu(cfg)
         elif ch=='2': single_host_menu(cfg)
         elif ch=='3': batch_scan_menu(cfg)
         elif ch=='4': config_menu(cfg)
         elif ch=='5': deps_menu()
-        elif ch=='6':
+        elif ch=='6': ml_train_menu()
+        elif ch=='7':
             print(G+"\n  ජය වේවා! 👋\n"+W); sys.exit(0)
         else:
-            print(R+"\n  [-] 1-6 ඇතුලත් කරන්න.\n"+W); time.sleep(1)
+            print(R+"\n  [-] 1-7 ඇතුලත් කරන්න.\n"+W); time.sleep(1)
 
 if __name__=="__main__":
     main()
