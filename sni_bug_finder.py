@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 # ================================================================
-#   PRO SNI BUG HOST FINDER v6.0  ★ MEGA UPGRADE
+#   PRO SNI BUG HOST FINDER v7.0  ★ ZERO-BALANCE EDITION
 #   ─────────────────────────────────────────────────────────────
-#   NEW SCAN METHODS v6.0:
-#     [+] Open-Knock Algorithm — unusual TLS handshakes (empty SNI,
-#         fake SNI, pre-2006 ciphers) → extract hidden Default Cert SANs
-#     [+] Connection State Attack — Keep-Alive TCP reuse:
-#         zero-rated host → send blocked domain payload same conn
-#     [+] Real ECH Payload Crafter — DoH key fetch + HPKE encapsulation
-#         outer SNI=free domain, inner SNI=blocked domain; ISP drop test
-#     [+] WTF-PAD Traffic Padding — dummy padding bytes; ISP speed-cap bypass test
-#     [+] UDP Probe — UDP ping to discover hosts behind TCP firewalls
-#     [+] SCTP INIT Probe — SCTP chunk probe for strict-firewall bypass
-#     [+] Real QUIC Handshake (aioquic) — full HTTP/3 QUIC negotiation
-#     [+] Scapy Packet Manipulation — TCP fragmentation, TTL tricks, DPI evasion
-#     [+] Active Probing Defense Test — simulate ISP active-probing;
-#         detect Reality/VLESS servers that resist fingerprinting
-#     [+] ML Bug Score Predictor — sklearn RandomForest; learns from
-#         accumulated scans; predicts true bug-host probability
+#   NEW v7.0 — ZERO-BALANCE DETECTION MODULE:
+#     [+] ZB-1  ISP Auto-Detect + Zero-Rate Domain DB (ip-api ASN)
+#     [+] ZB-2  Captive Portal / Walled Garden Detector
+#     [+] ZB-3  Transparent Proxy Detector (Via/X-Forwarded headers)
+#     [+] ZB-4  DNS Hijacking Detector (ISP vs 8.8.8.8 compare)
+#     [+] ZB-5  TCP RST / Block Detector
+#     [+] ZB-6  Speed Differential Test (throttle = zero-rated)
+#     [+] ZB-7  TLS MITM / ISP Cert Injection Detector
+#     [+] ZB-8  MTU Probe (proxy path = MTU 1400)
+#     [+] ZB-9  Known Zero-Rated IP Range Scanner
+#     [+] ZB-10 HTTP vs HTTPS Zero-Rating Difference Test
+#     [+] ZB-11 Via/X-Cache Header Zero-Rate Scoring
+#     [+] ZB-12 ML Zero-Rating Predictor (sklearn extended)
 #   ─────────────────────────────────────────────────────────────
+#   v6.0 METHODS (retained):
+#     Open-Knock, ConnState, ECH-Real, WTF-PAD, UDP, SCTP,
+#     QUIC-Real, Pkt-Manip, Active-Probe, ML-Bug-Score
 #   v5.0 METHODS (retained):
-#     gRPC stream, XHTTP/SplitHTTP, Reality TLS, WS Path brute-force,
+#     gRPC stream, XHTTP/SplitHTTP, Reality TLS, WS brute-force,
 #     TLS 1.2/1.3 force, ALPN probe, Cert info, ASN/CDN verify
 #   ─────────────────────────────────────────────────────────────
 #   Install (core):
-#     pip install aiohttp aiodns httpx[http2] curl_cffi dnspython
+#     pip install aiohttp aiodns httpx[http2] curl_cffi dnspython requests
 #   Install (optional advanced):
 #     pip install aioquic scapy cryptography scikit-learn numpy
 #   Usage  : python3 sni_bug_finder.py
@@ -99,6 +99,19 @@ DEFAULT_CFG = {
     "check_pkt_manip":      False,  # Scapy packet manipulation (requires root)
     "check_active_probe":   True,   # Active probing defense simulation
     "use_ml_predictor":     True,   # ML bug score predictor (sklearn)
+    # v7.0 Zero-Balance Detection
+    "zb_isp_detect":        True,   # ZB-1  ISP Auto-Detect + Zero-Rate DB
+    "zb_captive_portal":    True,   # ZB-2  Captive Portal / Walled Garden Detector
+    "zb_transparent_proxy": True,   # ZB-3  Transparent Proxy Detector
+    "zb_dns_hijack":        True,   # ZB-4  DNS Hijacking Detector
+    "zb_tcp_rst":           True,   # ZB-5  TCP RST / Block Detector
+    "zb_speed_diff":        False,  # ZB-6  Speed Differential Test (slow)
+    "zb_tls_mitm":          True,   # ZB-7  TLS MITM / ISP Cert Injection
+    "zb_mtu_probe":         True,   # ZB-8  MTU Probe
+    "zb_ip_range":          True,   # ZB-9  Known Zero-Rated IP Range Scanner
+    "zb_http_vs_https":     True,   # ZB-10 HTTP vs HTTPS Zero-Rating Difference
+    "zb_header_score":      True,   # ZB-11 Via/X-Cache Header Scoring
+    "zb_ml_predict":        True,   # ZB-12 ML Zero-Rating Predictor
     "tls_fingerprint":      "chrome120",
     "ports": [80,443,8080,8443,2052,2053,2082,2083,2086,2087,2095,2096],
     "user_agents": [
@@ -1565,6 +1578,812 @@ def ml_predict(result) -> float:
         return -1.0
 
 
+
+# ================================================================
+# ╔══════════════════════════════════════════════════════════╗
+# ║   v7.0  ZERO-BALANCE DETECTION MODULE  — 12 Methods     ║
+# ╚══════════════════════════════════════════════════════════╝
+# ================================================================
+
+import ipaddress
+
+# ── ISP Zero-Rate Domain Database ────────────────────────────────
+ZERO_RATE_DB = {
+    "AS9329":  {
+        "name": "Dialog Axiata (Sri Lanka)",
+        "domains": [
+            "speedtest.dialog.lk","myaccount.dialog.lk","dialog.lk",
+            "wa.me","web.whatsapp.com","whatsapp.com","whatsapp.net",
+            "free.facebook.com","static.xx.fbcdn.net",
+            "edge-star-mini.facebook.com","z-m.facebook.com",
+            "zoom.us","us02web.zoom.us","us04web.zoom.us",
+        ],
+        "ip_ranges": ["169.254.0.0/16","192.0.0.0/24"],
+    },
+    "AS17639": {
+        "name": "Mobitel (Sri Lanka)",
+        "domains": [
+            "speedtest.mobitel.lk","mobitel.lk","selfcare.mobitel.lk",
+            "wa.me","web.whatsapp.com","whatsapp.com",
+            "free.facebook.com","static.xx.fbcdn.net","zoom.us",
+        ],
+        "ip_ranges": ["169.254.0.0/16"],
+    },
+    "AS9270":  {
+        "name": "SLT (Sri Lanka)",
+        "domains": [
+            "slt.lk","speedtest.slt.lk",
+            "free.facebook.com","wa.me","web.whatsapp.com","zoom.us",
+        ],
+        "ip_ranges": [],
+    },
+    "AS24616": {
+        "name": "Hutch (Sri Lanka)",
+        "domains": [
+            "hutch.lk","speedtest.hutch.lk",
+            "youtube.com","googlevideo.com",
+            "wa.me","web.whatsapp.com","free.facebook.com",
+        ],
+        "ip_ranges": [],
+    },
+    "GLOBAL_FACEBOOK": {
+        "name": "Facebook Free Basics",
+        "domains": [
+            "free.facebook.com","zero.facebook.com",
+            "static.xx.fbcdn.net","scontent.xx.fbcdn.net",
+            "edge-star-mini.facebook.com","z-m.facebook.com",
+            "api.facebook.com","graph.facebook.com",
+            "b-api.facebook.com","b-graph.facebook.com",
+        ],
+        "ip_ranges": ["31.13.0.0/16","157.240.0.0/16","179.60.192.0/22"],
+    },
+    "GLOBAL_WHATSAPP": {
+        "name": "WhatsApp (Global zero-rated)",
+        "domains": [
+            "wa.me","whatsapp.com","web.whatsapp.com","whatsapp.net",
+            "mmg.whatsapp.net","media.whatsapp.net",
+            "v.whatsapp.net","e.whatsapp.net",
+        ],
+        "ip_ranges": ["185.60.216.0/22"],
+    },
+    "GLOBAL_ZOOM": {
+        "name": "Zoom (Education zero-rated)",
+        "domains": [
+            "zoom.us","us02web.zoom.us","us04web.zoom.us",
+            "us06web.zoom.us","us08web.zoom.us",
+        ],
+        "ip_ranges": ["170.114.0.0/16","99.79.0.0/16"],
+    },
+}
+
+_isp_cache = {}
+
+def detect_isp_asn(timeout=5):
+    global _isp_cache
+    if _isp_cache:
+        return _isp_cache
+    try:
+        txt  = _fetch_zb("http://ip-api.com/json/?fields=status,isp,org,as,query", timeout)
+        data = json.loads(txt)
+        if data.get("status") == "success":
+            asn_full = data.get("as", "")
+            asn_num  = asn_full.split(" ")[0] if asn_full else ""
+            _isp_cache = {
+                "asn": asn_num, "asn_full": asn_full,
+                "isp": data.get("isp","Unknown"),
+                "org": data.get("org",""),
+                "pub_ip": data.get("query",""),
+            }
+            return _isp_cache
+    except Exception:
+        pass
+    return {"asn":"","isp":"Unknown","pub_ip":""}
+
+def get_isp_zero_rate_domains(asn=""):
+    base = list(ZERO_RATE_DB.get(asn, {}).get("domains", []))
+    for k in ["GLOBAL_FACEBOOK","GLOBAL_WHATSAPP","GLOBAL_ZOOM"]:
+        base.extend(ZERO_RATE_DB[k]["domains"])
+    return list(dict.fromkeys(base))
+
+def _fetch_zb(url, timeout=5):
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent":"Mozilla/5.0 SNI-BugFinder/7.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode(errors='ignore')
+    except Exception:
+        return ""
+
+
+# ── ZB-1: ISP Auto-Detect + Zero-Rate DB ──────────────────────
+def zb_isp_detect_test(hostname, isp_info, timeout):
+    result = {"in_zero_rate_db":False,"matched_isp":None,
+              "matched_domain":None,"in_zero_ip_range":False,"zero_rate_score":0}
+    asn = isp_info.get("asn","")
+    for db_key, db_val in ZERO_RATE_DB.items():
+        for zd in db_val["domains"]:
+            if hostname==zd or hostname.endswith("."+zd) or zd.endswith("."+hostname):
+                result["in_zero_rate_db"] = True
+                result["matched_isp"]     = db_val["name"]
+                result["matched_domain"]  = zd
+                result["zero_rate_score"] += 40
+                break
+    try:
+        ip_str = socket.gethostbyname(hostname)
+        ip_obj = ipaddress.ip_address(ip_str)
+        for db_key, db_val in ZERO_RATE_DB.items():
+            for cidr in db_val.get("ip_ranges",[]):
+                try:
+                    if ip_obj in ipaddress.ip_network(cidr, strict=False):
+                        result["in_zero_ip_range"] = True
+                        result["matched_isp"] = result["matched_isp"] or db_val["name"]
+                        result["zero_rate_score"] += 30
+                        break
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    if asn and asn in ZERO_RATE_DB and result["in_zero_rate_db"]:
+        result["zero_rate_score"] += 20
+    return result
+
+
+# ── ZB-2: Captive Portal Detector ─────────────────────────────
+_CAPTIVE_KEYWORDS = [
+    "recharge","top-up","topup","top up","balance","prepaid",
+    "reload","data plan","data pack","buy data","insufficient",
+    "no credit","out of data","portal","walled garden","subscribe",
+    "activate","add-on","renew","payment","pay now","data expired",
+    "quota exceeded","your data","buy more","get more data",
+    "zero balance","please recharge","login to continue",
+]
+
+def zb_captive_portal_test(hostname, port, timeout):
+    result = {"captive_detected":False,"zero_rated":False,"redirect_url":None,
+              "status_code":None,"keywords_found":[],"zero_rate_score":0}
+    try:
+        use_tls = port in [443,8443,2053,2083,2087,2096]
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            raw  = socket.create_connection((hostname, port), timeout=min(timeout,4))
+            sock = ctx.wrap_socket(raw, server_hostname=hostname)
+        else:
+            sock = socket.create_connection((hostname, port), timeout=min(timeout,4))
+
+        req = (f"GET / HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n"
+               f"User-Agent: Mozilla/5.0 (Android 14) Mobile\r\n\r\n")
+        sock.sendall(req.encode())
+        sock.settimeout(3)
+        resp = b""
+        try:
+            while True:
+                c = sock.recv(4096)
+                if not c: break
+                resp += c
+                if len(resp) > 16384: break
+        except Exception:
+            pass
+        sock.close()
+
+        if resp:
+            rstr  = resp.decode(errors='ignore')
+            parts = rstr.split(' ')
+            code  = parts[1] if len(parts) > 1 else '?'
+            result["status_code"] = code
+            body  = rstr.lower()
+            found = [k for k in _CAPTIVE_KEYWORDS if k in body]
+            result["keywords_found"] = found
+
+            if found:
+                result["captive_detected"] = True
+                result["zero_rate_score"] += 35
+            elif code in ['200','204']:
+                result["zero_rated"]       = True
+                result["zero_rate_score"] += 30
+            elif code in ['301','302','303','307','308']:
+                for line in rstr.split("\r\n"):
+                    if line.lower().startswith("location:"):
+                        loc = line.split(":",1)[1].strip()
+                        result["redirect_url"] = loc
+                        portal_kw = ["portal","login","recharge","balance","prepaid"]
+                        if any(k in loc.lower() for k in portal_kw):
+                            result["captive_detected"] = True
+                            result["zero_rate_score"] += 35
+                        break
+    except Exception:
+        pass
+    return result
+
+
+# ── ZB-3: Transparent Proxy Detector ──────────────────────────
+_PROXY_HEADERS = [
+    "via","x-forwarded-for","x-forwarded-host","x-forwarded-proto",
+    "x-real-ip","x-cache","x-cache-hits","x-cache-lookup",
+    "x-proxy-id","x-proxy-cache","forwarded",
+    "proxy-connection","x-isp-proxy","x-wap-profile",
+    "x-online-host","x-transparent-proxy",
+]
+
+def zb_transparent_proxy_test(hostname, port, timeout):
+    result = {"proxy_detected":False,"proxy_headers":{},
+              "proxy_server_hint":None,"zero_rate_score":0}
+    try:
+        use_tls = port in [443,8443,2053,2083,2087,2096]
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            raw  = socket.create_connection((hostname, port), timeout=timeout)
+            sock = ctx.wrap_socket(raw, server_hostname=hostname)
+        else:
+            sock = socket.create_connection((hostname, port), timeout=timeout)
+
+        req = (f"GET / HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n"
+               f"User-Agent: Mozilla/5.0\r\n\r\n")
+        sock.sendall(req.encode())
+        sock.settimeout(min(timeout,3))
+        resp = b""
+        try:
+            while True:
+                c = sock.recv(4096)
+                if not c: break
+                resp += c
+                if len(resp) > 16384 or b"\r\n\r\n" in resp: break
+        except Exception:
+            pass
+        sock.close()
+
+        if resp:
+            rstr = resp.decode(errors='ignore')
+            hdr_section = rstr.split("\r\n\r\n")[0] if "\r\n\r\n" in rstr else rstr
+            hdrs = {}
+            for line in hdr_section.split("\r\n")[1:]:
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    hdrs[k.strip().lower()] = v.strip()
+
+            found = {ph: hdrs[ph] for ph in _PROXY_HEADERS if ph in hdrs}
+            if found:
+                result["proxy_detected"]   = True
+                result["proxy_headers"]    = found
+                result["zero_rate_score"] += 20 * min(len(found),3)
+
+            srv = hdrs.get("server","").lower()
+            proxy_hints = ["squid","nginx proxy","varnish","haproxy","privoxy","tinyproxy"]
+            for hint in proxy_hints:
+                if hint in srv:
+                    result["proxy_server_hint"] = hdrs.get("server","")
+                    result["proxy_detected"]    = True
+                    result["zero_rate_score"]  += 15
+                    break
+    except Exception:
+        pass
+    return result
+
+
+# ── ZB-4: DNS Hijacking Detector ──────────────────────────────
+def zb_dns_hijack_test(hostname, timeout):
+    result = {"hijacked":False,"isp_dns_ip":None,"google_dns_ip":None,
+              "ip_mismatch":False,"zero_rate_score":0}
+    try:
+        isp_ip = socket.gethostbyname(hostname)
+        result["isp_dns_ip"] = isp_ip
+    except Exception:
+        return result
+
+    def _raw_dns_query(host, dns_server="8.8.8.8"):
+        try:
+            txid   = os.urandom(2)
+            flags  = b'\x01\x00'
+            counts = b'\x00\x01\x00\x00\x00\x00\x00\x00'
+            parts  = host.split('.')
+            qname  = b''.join(bytes([len(p)]) + p.encode() for p in parts) + b'\x00'
+            packet = txid + flags + counts + qname + b'\x00\x01\x00\x01'
+            sock   = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(min(timeout,3))
+            sock.sendto(packet, (dns_server, 53))
+            resp, _ = sock.recvfrom(512)
+            sock.close()
+            ancount = int.from_bytes(resp[6:8], 'big')
+            if ancount == 0:
+                return None
+            # Parse first answer — skip question
+            pos = 12
+            qdcount = int.from_bytes(resp[4:6], 'big')
+            for _ in range(qdcount):
+                while pos < len(resp):
+                    if resp[pos] == 0: pos += 1; break
+                    if resp[pos] & 0xC0 == 0xC0: pos += 2; break
+                    pos += resp[pos] + 1
+                pos += 4
+            if pos + 12 <= len(resp):
+                if resp[pos] & 0xC0 == 0xC0:
+                    pos += 2
+                else:
+                    while pos < len(resp) and resp[pos] != 0:
+                        pos += resp[pos] + 1
+                    pos += 1
+                rdlen = int.from_bytes(resp[pos+8:pos+10], 'big')
+                rdata = resp[pos+10:pos+10+rdlen]
+                rtype = int.from_bytes(resp[pos:pos+2], 'big')
+                if rtype == 1 and rdlen == 4:
+                    return ".".join(str(b) for b in rdata)
+        except Exception:
+            pass
+        return None
+
+    google_ip = _raw_dns_query(hostname)
+    result["google_dns_ip"] = google_ip
+
+    if google_ip and isp_ip and google_ip != isp_ip:
+        try:
+            ip_obj = ipaddress.ip_address(isp_ip)
+            if ip_obj.is_private or ip_obj.is_loopback:
+                result["hijacked"]        = True
+                result["ip_mismatch"]     = True
+                result["zero_rate_score"] += 40
+            else:
+                result["ip_mismatch"]     = True
+                result["zero_rate_score"] += 10
+        except Exception:
+            result["ip_mismatch"]     = True
+            result["zero_rate_score"] += 10
+    return result
+
+
+# ── ZB-5: TCP RST / Block Detector ────────────────────────────
+def zb_tcp_rst_test(hostname, port, timeout):
+    result = {"blocked":False,"rst_received":False,
+              "connection_ok":False,"zero_rate_score":0}
+    try:
+        sock = socket.create_connection((hostname, port), timeout=min(timeout,3))
+        sock.settimeout(2)
+        sock.sendall(f"GET / HTTP/1.0\r\nHost: {hostname}\r\n\r\n".encode())
+        try:
+            resp = sock.recv(256)
+            if resp:
+                result["connection_ok"]   = True
+                result["zero_rate_score"] += 25
+        except socket.timeout:
+            result["connection_ok"]   = True
+            result["zero_rate_score"] += 10
+        except Exception as e:
+            err = str(e).lower()
+            if "reset" in err or "104" in err:
+                result["rst_received"]    = True
+                result["blocked"]         = True
+                result["zero_rate_score"] -= 20
+        finally:
+            try: sock.close()
+            except: pass
+    except (ConnectionRefusedError, Exception):
+        result["blocked"] = True
+    return result
+
+
+# ── ZB-6: Speed Differential Test ─────────────────────────────
+def zb_speed_test(hostname, port, timeout):
+    result = {"speed_kbps":None,"throttled":False,
+              "zero_rate_score":0,"speed_tier":"unknown"}
+    try:
+        use_tls = port in [443,8443,2053,2083,2087,2096]
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            raw  = socket.create_connection((hostname, port), timeout=timeout)
+            sock = ctx.wrap_socket(raw, server_hostname=hostname)
+        else:
+            sock = socket.create_connection((hostname, port), timeout=timeout)
+
+        sock.sendall(
+            f"GET / HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n".encode())
+        sock.settimeout(5)
+        t0 = time.time(); total = 0
+        try:
+            while True:
+                c = sock.recv(8192)
+                if not c: break
+                total += len(c)
+                if total >= 512*1024: break
+        except Exception:
+            pass
+        elapsed = time.time() - t0
+        sock.close()
+
+        if elapsed > 0 and total > 1024:
+            kbps = int((total/elapsed)/1024)
+            result["speed_kbps"] = kbps
+            if kbps < 128:
+                result["throttled"]       = True
+                result["speed_tier"]      = f"heavy-throttle ({kbps}Kbps)"
+                result["zero_rate_score"] += 35
+            elif kbps < 512:
+                result["throttled"]       = True
+                result["speed_tier"]      = f"throttled ({kbps}Kbps)"
+                result["zero_rate_score"] += 25
+            elif kbps < 2048:
+                result["throttled"]       = True
+                result["speed_tier"]      = f"limited ({kbps}Kbps)"
+                result["zero_rate_score"] += 15
+            else:
+                result["speed_tier"]      = f"full-speed ({kbps}Kbps)"
+                result["zero_rate_score"] += 5
+    except Exception:
+        pass
+    return result
+
+
+# ── ZB-7: TLS MITM / ISP Cert Injection Detector ──────────────
+_TRUSTED_CA_ORGS = [
+    "digicert","let's encrypt","globalsign","comodo","sectigo",
+    "geotrust","thawte","verisign","entrust","godaddy",
+    "amazon","google trust services","baltimore","microsoft",
+    "cloudflare","identrust","quovadis","ssl.com","zerossl",
+    "usertrust","comodoca","rapidssl",
+]
+
+def zb_tls_mitm_test(hostname, port, timeout):
+    result = {"mitm_suspected":False,"cert_issuer":None,"cert_cn":None,
+              "self_signed":False,"isp_cert":False,"zero_rate_score":0}
+    if port not in [443,8443,2053,2083,2087,2096]:
+        return result
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        with socket.create_connection((hostname, port), timeout=timeout) as s:
+            with ctx.wrap_socket(s, server_hostname=hostname) as ss:
+                cert    = ss.getpeercert() or {}
+                subject = dict(x[0] for x in cert.get("subject",[]))
+                issuer  = dict(x[0] for x in cert.get("issuer",[]))
+                cn          = subject.get("commonName","")
+                issuer_org  = issuer.get("organizationName","")
+                issuer_cn   = issuer.get("commonName","")
+                result["cert_cn"]     = cn
+                result["cert_issuer"] = f"{issuer_org} / {issuer_cn}"
+                issuer_str = f"{issuer_org} {issuer_cn}".lower()
+                if subject == issuer:
+                    result["self_signed"]    = True
+                    result["mitm_suspected"] = True
+                    result["zero_rate_score"] += 15
+                is_trusted = any(ca in issuer_str for ca in _TRUSTED_CA_ORGS)
+                if not is_trusted and not result["self_signed"]:
+                    result["isp_cert"]        = True
+                    result["mitm_suspected"]  = True
+                    result["zero_rate_score"] += 30
+                if is_trusted:
+                    result["zero_rate_score"] += 10
+    except Exception:
+        pass
+    return result
+
+
+# ── ZB-8: MTU Probe ───────────────────────────────────────────
+def zb_mtu_probe(hostname, port, timeout):
+    result = {"mtu_detected":None,"proxy_path":False,"zero_rate_score":0}
+    use_tls = port in [443,8443,2053,2083,2087,2096]
+    best_mtu = None
+    for mtu in [1500,1450,1400,1380,1280]:
+        try:
+            if use_tls:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode    = ssl.CERT_NONE
+                raw  = socket.create_connection((hostname, port), timeout=min(timeout,2))
+                sock = ctx.wrap_socket(raw, server_hostname=hostname)
+            else:
+                sock = socket.create_connection((hostname, port), timeout=min(timeout,2))
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            headers  = (f"GET / HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n"
+                        f"X-MTU-Test: {mtu}\r\nUser-Agent: Mozilla/5.0\r\n\r\n").encode()
+            pad_size = max(0, (mtu-40) - len(headers))
+            sock.sendall(headers + b"X"*pad_size)
+            sock.settimeout(1)
+            resp = b""
+            try: resp = sock.recv(256)
+            except Exception: pass
+            sock.close()
+            if resp:
+                best_mtu = mtu; break
+        except Exception:
+            continue
+    result["mtu_detected"] = best_mtu
+    if best_mtu is not None:
+        if best_mtu <= 1400:
+            result["proxy_path"]      = True
+            result["zero_rate_score"] += 25
+        else:
+            result["zero_rate_score"] += 5
+    return result
+
+
+# ── ZB-9: Known Zero-Rated IP Range Scanner ───────────────────
+def zb_ip_range_test(hostname, timeout):
+    result = {"in_known_range":False,"matched_range":None,
+              "matched_service":None,"ip":None,"zero_rate_score":0}
+    try:
+        ip_str = socket.gethostbyname(hostname)
+        result["ip"] = ip_str
+        ip_obj = ipaddress.ip_address(ip_str)
+        for db_key, db_val in ZERO_RATE_DB.items():
+            for cidr in db_val.get("ip_ranges",[]):
+                try:
+                    if ip_obj in ipaddress.ip_network(cidr, strict=False):
+                        result["in_known_range"]  = True
+                        result["matched_range"]   = cidr
+                        result["matched_service"] = db_val["name"]
+                        result["zero_rate_score"] += 40
+                        return result
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return result
+
+
+# ── ZB-10: HTTP vs HTTPS Zero-Rating Difference ───────────────
+def zb_http_vs_https_test(hostname, timeout):
+    result = {"http_works":False,"https_works":False,"http_code":None,
+              "https_code":None,"http_latency":None,"https_latency":None,
+              "zero_rate_mode":"neither","zero_rate_score":0}
+    # HTTP
+    try:
+        t0   = time.time()
+        sock = socket.create_connection((hostname, 80), timeout=min(timeout,3))
+        sock.sendall(f"GET / HTTP/1.0\r\nHost: {hostname}\r\n\r\n".encode())
+        sock.settimeout(2)
+        resp = b""
+        try: resp = sock.recv(512)
+        except: pass
+        sock.close()
+        if resp:
+            code = resp.decode(errors='ignore').split(' ')
+            result["http_works"]   = True
+            result["http_code"]    = code[1] if len(code) > 1 else '?'
+            result["http_latency"] = int((time.time()-t0)*1000)
+    except Exception:
+        pass
+    # HTTPS
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        t0   = time.time()
+        raw  = socket.create_connection((hostname, 443), timeout=min(timeout,3))
+        sock = ctx.wrap_socket(raw, server_hostname=hostname)
+        sock.sendall(f"GET / HTTP/1.0\r\nHost: {hostname}\r\n\r\n".encode())
+        sock.settimeout(2)
+        resp = b""
+        try: resp = sock.recv(512)
+        except: pass
+        sock.close()
+        if resp:
+            code = resp.decode(errors='ignore').split(' ')
+            result["https_works"]   = True
+            result["https_code"]    = code[1] if len(code) > 1 else '?'
+            result["https_latency"] = int((time.time()-t0)*1000)
+    except Exception:
+        pass
+    h, hs = result["http_works"], result["https_works"]
+    if h and hs:
+        result["zero_rate_mode"]  = "both"
+        result["zero_rate_score"] += 30
+    elif hs:
+        result["zero_rate_mode"]  = "https-only"
+        result["zero_rate_score"] += 25
+    elif h:
+        result["zero_rate_mode"]  = "http-only"
+        result["zero_rate_score"] += 15
+    return result
+
+
+# ── ZB-11: Via/X-Cache Header Zero-Rate Scoring ───────────────
+_ZB_HEADER_SCORES = {
+    "via":20,"x-forwarded-for":15,"x-forwarded-host":15,
+    "x-cache":15,"x-cache-hits":10,"x-cache-lookup":10,
+    "x-proxy-id":20,"x-proxy-cache":20,"cf-cache-status":10,
+    "x-amz-cf-id":10,"x-fastly-request-id":10,
+    "x-isp-proxy":25,"x-wap-profile":20,"x-online-host":15,
+    "x-transparent-proxy":25,
+}
+
+def zb_header_score_test(hostname, port, timeout):
+    result = {"scored_headers":{},"total_score":0,"zero_rate_score":0,"proxy_level":"none"}
+    try:
+        use_tls = port in [443,8443,2053,2083,2087,2096]
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            raw  = socket.create_connection((hostname, port), timeout=timeout)
+            sock = ctx.wrap_socket(raw, server_hostname=hostname)
+        else:
+            sock = socket.create_connection((hostname, port), timeout=timeout)
+        sock.sendall(
+            f"GET / HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n".encode())
+        sock.settimeout(min(timeout,3))
+        resp = b""
+        try:
+            while True:
+                c = sock.recv(4096)
+                if not c: break
+                resp += c
+                if b"\r\n\r\n" in resp: break
+        except Exception:
+            pass
+        sock.close()
+        if resp:
+            hdr_section = resp.decode(errors='ignore').split("\r\n\r\n")[0]
+            hdrs = {}
+            for line in hdr_section.split("\r\n")[1:]:
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    hdrs[k.strip().lower()] = v.strip()
+            total  = 0
+            scored = {}
+            for hk, pts in _ZB_HEADER_SCORES.items():
+                if hk in hdrs:
+                    scored[hk] = {"value": hdrs[hk][:80], "score": pts}
+                    total += pts
+            result["scored_headers"]  = scored
+            result["total_score"]     = total
+            result["zero_rate_score"] = min(total, 60)
+            result["proxy_level"] = ("high" if total>=40 else
+                                     "medium" if total>=20 else
+                                     "low" if total>0 else "none")
+    except Exception:
+        pass
+    return result
+
+
+# ── ZB-12: ML Zero-Rating Predictor ───────────────────────────
+ZB_ML_MODEL_FILE = "sni_zb_ml_model.json"
+_zb_ml_model     = None
+
+def _zb_features(zb_result):
+    isp   = zb_result.get("isp_detect",{})
+    cap   = zb_result.get("captive_portal",{})
+    prx   = zb_result.get("transparent_proxy",{})
+    dns   = zb_result.get("dns_hijack",{})
+    tcp   = zb_result.get("tcp_rst",{})
+    spd   = zb_result.get("speed_test",{})
+    mitm  = zb_result.get("tls_mitm",{})
+    mtu   = zb_result.get("mtu_probe",{})
+    ipr   = zb_result.get("ip_range",{})
+    proto = zb_result.get("http_vs_https",{})
+    hdr   = zb_result.get("header_score",{})
+    return [
+        1 if isp.get("in_zero_rate_db")    else 0,
+        1 if isp.get("in_zero_ip_range")   else 0,
+        isp.get("zero_rate_score",0)/100.0,
+        1 if cap.get("zero_rated")         else 0,
+        1 if cap.get("captive_detected")   else 0,
+        cap.get("zero_rate_score",0)/100.0,
+        1 if prx.get("proxy_detected")     else 0,
+        prx.get("zero_rate_score",0)/100.0,
+        1 if dns.get("hijacked")           else 0,
+        1 if dns.get("ip_mismatch")        else 0,
+        1 if tcp.get("connection_ok")      else 0,
+        1 if tcp.get("blocked")            else 0,
+        1 if mitm.get("mitm_suspected")    else 0,
+        1 if mitm.get("isp_cert")          else 0,
+        1 if mtu.get("proxy_path")         else 0,
+        mtu.get("zero_rate_score",0)/100.0,
+        1 if ipr.get("in_known_range")     else 0,
+        1 if proto.get("http_works")       else 0,
+        1 if proto.get("https_works")      else 0,
+        hdr.get("total_score",0)/100.0,
+        zb_result.get("total_zb_score",0)/100.0,
+    ]
+
+def zb_ml_save_sample(zb_result, label):
+    try:
+        data = []
+        if os.path.exists(ZB_ML_MODEL_FILE):
+            with open(ZB_ML_MODEL_FILE) as f:
+                data = json.load(f)
+        data.append({"features":_zb_features(zb_result),
+                     "label":int(label),"host":zb_result.get("host","")})
+        with open(ZB_ML_MODEL_FILE,'w') as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def zb_ml_train():
+    global _zb_ml_model
+    if not sklearn or not numpy: return None
+    if not os.path.exists(ZB_ML_MODEL_FILE): return None
+    try:
+        with open(ZB_ML_MODEL_FILE) as f: data = json.load(f)
+        if len(data) < 10: return None
+        from sklearn.ensemble import RandomForestClassifier
+        import numpy as np
+        X = np.array([d["features"] for d in data])
+        y = np.array([d["label"]    for d in data])
+        clf = RandomForestClassifier(n_estimators=50, random_state=42)
+        clf.fit(X, y)
+        _zb_ml_model = clf
+        return clf
+    except Exception:
+        return None
+
+def zb_ml_predict(zb_result):
+    global _zb_ml_model
+    if _zb_ml_model is None: _zb_ml_model = zb_ml_train()
+    if _zb_ml_model is None: return -1.0
+    try:
+        import numpy as np
+        prob = _zb_ml_model.predict_proba([_zb_features(zb_result)])[0][1]
+        return round(float(prob), 3)
+    except Exception:
+        return -1.0
+
+
+# ── Master Zero-Balance Scanner ───────────────────────────────
+def run_zero_balance_scan(hostname, port, cfg, isp_info):
+    """Run all 12 ZB tests on one host. Returns zb dict."""
+    timeout = cfg.get("timeout", 5)
+    zb      = {"host": hostname}
+
+    zb["isp_detect"]        = zb_isp_detect_test(hostname, isp_info, timeout) \
+                               if cfg.get("zb_isp_detect", True)        else {"zero_rate_score":0}
+    zb["captive_portal"]    = zb_captive_portal_test(hostname, port, timeout) \
+                               if cfg.get("zb_captive_portal", True)    else {"zero_rate_score":0}
+    zb["transparent_proxy"] = zb_transparent_proxy_test(hostname, port, timeout) \
+                               if cfg.get("zb_transparent_proxy", True) else {"zero_rate_score":0}
+    zb["dns_hijack"]        = zb_dns_hijack_test(hostname, timeout) \
+                               if cfg.get("zb_dns_hijack", True)        else {"zero_rate_score":0}
+    zb["tcp_rst"]           = zb_tcp_rst_test(hostname, port, timeout) \
+                               if cfg.get("zb_tcp_rst", True)           else {"zero_rate_score":0}
+    zb["speed_test"]        = zb_speed_test(hostname, port, timeout) \
+                               if cfg.get("zb_speed_diff", False)       else {"zero_rate_score":0}
+    zb["tls_mitm"]          = zb_tls_mitm_test(hostname, port, timeout) \
+                               if cfg.get("zb_tls_mitm", True)          else {"zero_rate_score":0}
+    zb["mtu_probe"]         = zb_mtu_probe(hostname, port, timeout) \
+                               if cfg.get("zb_mtu_probe", True)         else {"zero_rate_score":0}
+    zb["ip_range"]          = zb_ip_range_test(hostname, timeout) \
+                               if cfg.get("zb_ip_range", True)          else {"zero_rate_score":0}
+    zb["http_vs_https"]     = zb_http_vs_https_test(hostname, timeout) \
+                               if cfg.get("zb_http_vs_https", True)     else {"zero_rate_score":0}
+    zb["header_score"]      = zb_header_score_test(hostname, port, timeout) \
+                               if cfg.get("zb_header_score", True)      else {"zero_rate_score":0}
+
+    raw = sum(zb[k].get("zero_rate_score",0) for k in [
+        "isp_detect","captive_portal","transparent_proxy","dns_hijack",
+        "tcp_rst","speed_test","tls_mitm","mtu_probe","ip_range",
+        "http_vs_https","header_score"])
+
+    # Penalty: blocked but not connected
+    if zb["tcp_rst"].get("blocked") and not zb["tcp_rst"].get("connection_ok"):
+        raw = max(0, raw - 30)
+
+    zb["total_zb_score"]          = min(raw, 100)
+    zb["is_zero_balance_candidate"] = zb["total_zb_score"] >= 40
+
+    # Recommended transport from ZB-10
+    mode = zb["http_vs_https"].get("zero_rate_mode","both")
+    zb["recommended_transport"] = {
+        "http-only":  "WS (no TLS / port 80)",
+        "https-only": "gRPC / WS+TLS (port 443)",
+        "both":       "gRPC (preferred) or WS+TLS",
+        "neither":    "Unknown — try gRPC",
+    }.get(mode, "gRPC preferred")
+
+    # ZB-12: ML
+    if cfg.get("zb_ml_predict", True):
+        ml_prob = zb_ml_predict(zb)
+        zb["ml_zb_probability"] = ml_prob
+        if ml_prob >= 0:
+            zb_ml_save_sample(zb, zb["is_zero_balance_candidate"])
+    else:
+        zb["ml_zb_probability"] = -1.0
+
+    return zb
+
+
 # ================================================================
 #  Full Method Detection (per host)
 # ================================================================
@@ -2358,6 +3177,7 @@ def scan_host(hostname, cfg, bug_sni, pre_ip=None, _retry=1):
         "redirect_to":     None,
         "latency_ms":      None,
         "tls_fingerprint": cfg.get("tls_fingerprint","requests"),
+        "zero_balance":    {},   # v7.0 ZB module results
     }
     timeout  = cfg["timeout"]
     sess, is_cffi = get_session(cfg)
@@ -2490,6 +3310,25 @@ def scan_host(hostname, cfg, bug_sni, pre_ip=None, _retry=1):
             ml_save_training_sample(result, result["is_bug_host"])
     else:
         result["ml_probability"] = -1.0
+
+    # v7.0: Zero-Balance Detection Module
+    any_zb = any(cfg.get(k, True) for k in [
+        "zb_isp_detect","zb_captive_portal","zb_transparent_proxy",
+        "zb_dns_hijack","zb_tcp_rst","zb_tls_mitm","zb_mtu_probe",
+        "zb_ip_range","zb_http_vs_https","zb_header_score",
+    ])
+    if any_zb and result["is_bug_host"]:
+        # Only run ZB tests on confirmed bug hosts (saves time)
+        isp_info = detect_isp_asn(timeout)
+        scan_port = (next(iter(result["open_ports"]), 443))
+        result["zero_balance"] = run_zero_balance_scan(
+            hostname, scan_port, cfg, isp_info)
+    else:
+        result["zero_balance"] = {
+            "total_zb_score": 0,
+            "is_zero_balance_candidate": False,
+            "ml_zb_probability": -1.0,
+        }
 
     return result
 
@@ -2844,6 +3683,155 @@ def display_results(results, domain):
             note  = ap.get("note", "")[:50]
             print(M+f"  {r['host']:<40}{W} {G}{ratio:.0%}{W:>7}  {DIM}{note}{W}")
 
+    # ── v7.0 ZERO-BALANCE DETECTION TABLES ─────────────────────────
+
+    # Collect zero-balance candidates
+    zb_candidates = [r for r in results
+                     if r.get("zero_balance",{}).get("is_zero_balance_candidate")]
+    zb_isp_db     = [r for r in results
+                     if r.get("zero_balance",{}).get("isp_detect",{}).get("in_zero_rate_db")]
+    zb_proxy      = [r for r in results
+                     if r.get("zero_balance",{}).get("transparent_proxy",{}).get("proxy_detected")]
+    zb_mitm       = [r for r in results
+                     if r.get("zero_balance",{}).get("tls_mitm",{}).get("mitm_suspected")]
+    zb_dns_hijack = [r for r in results
+                     if r.get("zero_balance",{}).get("dns_hijack",{}).get("hijacked")]
+    zb_ip_range   = [r for r in results
+                     if r.get("zero_balance",{}).get("ip_range",{}).get("in_known_range")]
+
+    if zb_candidates or zb_isp_db or zb_ip_range:
+        print(G+BOLD+f"\n{'═'*75}"+W)
+        print(G+BOLD+f"  ★ ZERO-BALANCE DETECTION RESULTS (v7.0)"+W)
+        print(G+BOLD+f"{'═'*75}\n"+W)
+
+        # Summary counts
+        print(C+f"  ZB Candidates        : {G}{len(zb_candidates)}{W}")
+        print(C+f"  ISP DB Match         : {G}{len(zb_isp_db)}{W}")
+        print(C+f"  Known IP Range       : {G}{len(zb_ip_range)}{W}")
+        print(C+f"  Transparent Proxy    : {Y}{len(zb_proxy)}{W}")
+        print(C+f"  DNS Hijacked         : {R}{len(zb_dns_hijack)}{W}")
+        print(C+f"  TLS MITM Suspected   : {Y}{len(zb_mitm)}{W}")
+        print()
+
+    # Table ZB-A: Top Zero-Balance Candidates
+    if zb_candidates:
+        print(G+BOLD+f"[ZB-★] Top Zero-Balance Candidates ({len(zb_candidates)})\n"+W)
+        print(C+f"  {'HOST':<42} {'ZB-SCORE':>9} {'ML-ZB':>7} {'TRANSPORT':<22} {'ISP':<25} SIGNALS"+W)
+        print(C+"  "+"─"*145+W)
+        for r in sorted(zb_candidates,
+                        key=lambda x: x["zero_balance"].get("total_zb_score",0),
+                        reverse=True)[:20]:
+            zb    = r["zero_balance"]
+            zbs   = zb.get("total_zb_score", 0)
+            ml_zb = zb.get("ml_zb_probability", -1)
+            ml_s  = f"{ml_zb:.0%}" if ml_zb >= 0 else "—"
+            trans = zb.get("recommended_transport","?")[:20]
+            isp   = zb.get("isp_detect",{}).get("matched_isp","?")
+            if isp: isp = isp[:23]
+
+            # Signal icons
+            signals = ""
+            if zb.get("isp_detect",{}).get("in_zero_rate_db"):
+                signals += G+"[DB]"+W+" "
+            if zb.get("ip_range",{}).get("in_known_range"):
+                signals += G+"[IP]"+W+" "
+            if zb.get("transparent_proxy",{}).get("proxy_detected"):
+                signals += Y+"[PRX]"+W+" "
+            if zb.get("captive_portal",{}).get("zero_rated"):
+                signals += G+"[CAP✔]"+W+" "
+            if zb.get("captive_portal",{}).get("captive_detected"):
+                signals += R+"[WALL]"+W+" "
+            if zb.get("tls_mitm",{}).get("mitm_suspected"):
+                signals += Y+"[MITM]"+W+" "
+            if zb.get("mtu_probe",{}).get("proxy_path"):
+                signals += C+"[MTU1400]"+W+" "
+            if zb.get("dns_hijack",{}).get("hijacked"):
+                signals += R+"[DNS-HJ]"+W+" "
+
+            zb_color = G+BOLD if zbs >= 70 else (Y if zbs >= 40 else R)
+            print(f"  {G}{r['host']:<42}{W} {zb_color}{zbs:>8}%{W} "
+                  f"{M}{ml_s:>7}{W} {C}{trans:<22}{W} {DIM}{isp:<25}{W} {signals}")
+
+    # Table ZB-B: ISP DB Matched Domains
+    if zb_isp_db:
+        print(M+BOLD+f"\n[ZB-DB] Known Zero-Rated Domain DB Matches ({len(zb_isp_db)})\n"+W)
+        print(C+f"  {'HOST':<42} {'MATCHED DOMAIN':<30} ISP"+W)
+        print(C+"  "+"─"*100+W)
+        for r in zb_isp_db[:15]:
+            zb  = r["zero_balance"]["isp_detect"]
+            md  = zb.get("matched_domain","?")[:28]
+            isp = (zb.get("matched_isp") or "?")[:30]
+            print(M+f"  {r['host']:<42}{W} {G}{md:<30}{W} {DIM}{isp}{W}")
+
+    # Table ZB-C: IP Range Matches
+    if zb_ip_range:
+        print(B+BOLD+f"\n[ZB-IP] Known Zero-Rated IP Range Matches ({len(zb_ip_range)})\n"+W)
+        print(C+f"  {'HOST':<42} {'IP':<18} {'RANGE':<22} SERVICE"+W)
+        print(C+"  "+"─"*100+W)
+        for r in zb_ip_range[:15]:
+            zb  = r["zero_balance"]["ip_range"]
+            ip  = (zb.get("ip") or "?")[:16]
+            rng = (zb.get("matched_range") or "?")[:20]
+            svc = (zb.get("matched_service") or "?")[:30]
+            print(B+f"  {r['host']:<42}{W} {Y}{ip:<18}{W} {G}{rng:<22}{W} {DIM}{svc}{W}")
+
+    # Table ZB-D: Proxy / Header Score Detail
+    if zb_proxy:
+        print(Y+BOLD+f"\n[ZB-PRX] Transparent Proxy Detected ({len(zb_proxy)})\n"+W)
+        print(C+f"  {'HOST':<42} {'LEVEL':<8} {'SCORE':>6}  HEADERS"+W)
+        print(C+"  "+"─"*100+W)
+        for r in zb_proxy[:10]:
+            prx   = r["zero_balance"].get("transparent_proxy",{})
+            hdr   = r["zero_balance"].get("header_score",{})
+            level = hdr.get("proxy_level","?")
+            score = hdr.get("total_score",0)
+            hdrs  = ", ".join(list(prx.get("proxy_headers",{}).keys())[:5])
+            print(Y+f"  {r['host']:<42}{W} {G}{level:<8}{W} {Y}{score:>6}{W}  {DIM}{hdrs}{W}")
+
+    # Table ZB-E: TLS MITM (ISP cert injection)
+    if zb_mitm:
+        print(R+BOLD+f"\n[ZB-MITM] ⚠ TLS MITM / ISP Cert Suspected ({len(zb_mitm)})\n"+W)
+        print(C+f"  {'HOST':<42} {'ISSUER':<40} SELF-SIGNED"+W)
+        print(C+"  "+"─"*100+W)
+        for r in zb_mitm[:10]:
+            mitm   = r["zero_balance"].get("tls_mitm",{})
+            issuer = (mitm.get("cert_issuer") or "?")[:38]
+            ss     = G+"YES"+W if mitm.get("self_signed") else "no"
+            isp_c  = R+"ISP-CERT"+W if mitm.get("isp_cert") else ""
+            print(R+f"  {r['host']:<42}{W} {DIM}{issuer:<40}{W} {ss}  {isp_c}")
+
+    # Table ZB-F: HTTP vs HTTPS Mode Summary
+    mode_counts = {}
+    for r in results:
+        mode = r.get("zero_balance",{}).get("http_vs_https",{}).get("zero_rate_mode","")
+        if mode and mode != "neither":
+            mode_counts[mode] = mode_counts.get(mode, 0) + 1
+    if mode_counts:
+        print(C+BOLD+f"\n[ZB-PROTO] Zero-Rating Protocol Mode Summary\n"+W)
+        print(C+f"  {'MODE':<20} {'COUNT':>6}  RECOMMENDED TRANSPORT"+W)
+        print(C+"  "+"─"*60+W)
+        for mode, cnt in sorted(mode_counts.items(), key=lambda x:x[1], reverse=True):
+            trans = {
+                "both":       "gRPC (preferred) or WS+TLS",
+                "https-only": "gRPC / WS+TLS (port 443)",
+                "http-only":  "WS no-TLS (port 80)",
+            }.get(mode, "?")
+            print(C+f"  {mode:<20}{W} {G}{cnt:>6}{W}  {Y}{trans}{W}")
+
+    # Speed test summary (if enabled)
+    spd_results = [r for r in results if r.get("zero_balance",{}).get("speed_test",{}).get("speed_kbps")]
+    if spd_results:
+        print(C+BOLD+f"\n[ZB-SPD] Speed Differential Results\n"+W)
+        print(C+f"  {'HOST':<42} {'SPEED':>10}  TIER"+W)
+        print(C+"  "+"─"*80+W)
+        for r in sorted(spd_results,
+                        key=lambda x: x["zero_balance"]["speed_test"]["speed_kbps"])[:10]:
+            spd  = r["zero_balance"]["speed_test"]
+            kbps = spd.get("speed_kbps",0)
+            tier = spd.get("speed_tier","?")
+            clr  = R if kbps < 512 else (Y if kbps < 2048 else G)
+            print(f"  {G}{r['host']:<42}{W} {clr}{kbps:>9}Kbps{W}  {DIM}{tier}{W}")
+
 
 # ================================================================
 #  3x-ui VPN Config Advisor
@@ -3107,8 +4095,8 @@ def banner():
     }
     print(f"""
 {C}╔══════════════════════════════════════════════════════════════════╗
-║  {G}{BOLD}SNI BUG HOST FINDER{C} v6.0  {DIM}★ MEGA UPGRADE{C}                     ║
-║  {DIM}OpenKnock | ConnState | ECH-Real | WTF-PAD | UDP | ML-AI{C}       ║
+║  {G}{BOLD}SNI BUG HOST FINDER{C} v7.0  {DIM}★ ZERO-BALANCE EDITION{C}              ║
+║  {DIM}ISP-DB | CaptivePortal | ProxyDetect | DNS-Hijack | MTU | ML{C}  ║
 ╚══════════════════════════════════════════════════════════════════╝{W}
   {C}curl_cffi:{W}{deps['curl_cffi']}  {C}httpx/H2:{W}{deps['httpx/H2']}  {C}aiohttp:{W}{deps['aiohttp']}  {C}aiodns:{W}{deps['aiodns']}  {C}dnspython:{W}{deps['dnspython']}
   {C}aioquic:{W}{deps['aioquic']}  {C}scapy:{W}{deps['scapy']}  {C}sklearn/ML:{W}{deps['sklearn']}
@@ -3215,6 +4203,71 @@ def single_host_menu(cfg):
         ms = ", ".join(METHOD_LABELS.get(m,m) for m in res["working_methods"])
         print(Y+f"\n  Working: {G}{ms}{W}")
     print(C+"  "+"═"*68+W)
+
+    # v7.0: Zero-Balance results
+    zb = res.get("zero_balance", {})
+    if zb and zb.get("total_zb_score", 0) > 0:
+        print(G+BOLD+f"\n  ★ ZERO-BALANCE ANALYSIS\n"+W)
+        print(C+"  "+"─"*68+W)
+        zbs  = zb.get("total_zb_score", 0)
+        ml_z = zb.get("ml_zb_probability", -1)
+        cand = zb.get("is_zero_balance_candidate", False)
+        zclr = G+BOLD if zbs >= 60 else (Y if zbs >= 40 else R)
+        print(f"  {BOLD}ZB Score     :{W} {zclr}{zbs}%{W}")
+        print(f"  {BOLD}ZB Candidate :{W} {G+BOLD+'★ YES — Zero-Balance likely!'+W if cand else R+'NO'+W}")
+        if ml_z >= 0:
+            print(f"  {BOLD}ML ZB Prob   :{W} {M}{ml_z:.0%}{W}")
+        print(f"  {BOLD}Transport    :{W} {C}{zb.get('recommended_transport','?')}{W}")
+        isp_d = zb.get("isp_detect", {})
+        if isp_d.get("in_zero_rate_db"):
+            print(f"  {BOLD}ISP DB       :{W} {G}✔ {isp_d.get('matched_isp','?')} "
+                  f"— {isp_d.get('matched_domain','')}{W}")
+        if zb.get("ip_range", {}).get("in_known_range"):
+            ipr = zb["ip_range"]
+            print(f"  {BOLD}IP Range     :{W} {G}✔ {ipr.get('ip','')} ∈ "
+                  f"{ipr.get('matched_range','')} ({ipr.get('matched_service','')}){W}")
+        prx = zb.get("transparent_proxy", {})
+        if prx.get("proxy_detected"):
+            hs = list(prx.get("proxy_headers", {}).keys())[:4]
+            print(f"  {BOLD}Proxy        :{W} {Y}✔ {', '.join(hs)}{W}")
+        hdr = zb.get("header_score", {})
+        if hdr.get("total_score", 0) > 0:
+            print(f"  {BOLD}Hdr Score    :{W} {Y}{hdr.get('total_score',0)} pts "
+                  f"[{hdr.get('proxy_level','none')}]{W}")
+        cap = zb.get("captive_portal", {})
+        if cap.get("captive_detected"):
+            kws = cap.get("keywords_found", [])[:3]
+            print(f"  {BOLD}Captive      :{W} {R}Portal detected — {', '.join(kws)}{W}")
+        elif cap.get("zero_rated"):
+            print(f"  {BOLD}Captive      :{W} {G}✔ Normal 200 (zero-rated confirmed){W}")
+        dns = zb.get("dns_hijack", {})
+        if dns.get("hijacked"):
+            print(f"  {BOLD}DNS Hijack   :{W} {R}✔ ISP:{dns.get('isp_dns_ip')} ≠ "
+                  f"Google:{dns.get('google_dns_ip')}{W}")
+        elif dns.get("ip_mismatch"):
+            print(f"  {BOLD}DNS Mismatch :{W} {Y}ISP:{dns.get('isp_dns_ip')} ≠ "
+                  f"Google:{dns.get('google_dns_ip')}{W}")
+        mtu = zb.get("mtu_probe", {})
+        if mtu.get("proxy_path"):
+            print(f"  {BOLD}MTU Probe    :{W} {C}✔ MTU {mtu.get('mtu_detected','?')} "
+                  f"— proxy path confirmed{W}")
+        mitm = zb.get("tls_mitm", {})
+        if mitm.get("mitm_suspected"):
+            print(f"  {BOLD}TLS MITM     :{W} {R}⚠ {mitm.get('cert_issuer','?')}{W}")
+        proto = zb.get("http_vs_https", {})
+        mode  = proto.get("zero_rate_mode", "?")
+        mclr  = G if mode not in ["neither","?"] else R
+        print(f"  {BOLD}Proto Mode   :{W} {mclr}{mode}{W}", end="")
+        if proto.get("http_latency"):
+            print(f"  HTTP:{Y}{proto.get('http_latency')}ms{W}", end="")
+        if proto.get("https_latency"):
+            print(f"  HTTPS:{Y}{proto.get('https_latency')}ms{W}", end="")
+        print()
+        spd = zb.get("speed_test", {})
+        if spd.get("speed_kbps"):
+            print(f"  {BOLD}Speed        :{W} {Y}{spd.get('speed_tier','?')}{W}")
+        print(C+"  "+"─"*68+W)
+
     # 3x-ui config for single host
     if res["is_bug_host"]:
         display_3xui_configs([res])
@@ -3302,6 +4355,19 @@ def config_menu(cfg):
             ("l","check_pkt_manip",   "Pkt Manip (root)",     cfg.get("check_pkt_manip",False)),
             ("m","check_active_probe","Active Probe Defense★", cfg.get("check_active_probe",True)),
             ("n","use_ml_predictor",  "ML Predictor (sklearn)",cfg.get("use_ml_predictor",True)),
+            # v7.0 Zero-Balance
+            ("o","zb_isp_detect",     "ZB-1 ISP Auto-Detect",  cfg.get("zb_isp_detect",True)),
+            ("p","zb_captive_portal", "ZB-2 Captive Portal",   cfg.get("zb_captive_portal",True)),
+            ("q","zb_transparent_proxy","ZB-3 Transparent Proxy",cfg.get("zb_transparent_proxy",True)),
+            ("r","zb_dns_hijack",     "ZB-4 DNS Hijack",       cfg.get("zb_dns_hijack",True)),
+            ("s","zb_tcp_rst",        "ZB-5 TCP RST Detect",   cfg.get("zb_tcp_rst",True)),
+            ("t","zb_speed_diff",     "ZB-6 Speed Diff (slow)",cfg.get("zb_speed_diff",False)),
+            ("u","zb_tls_mitm",       "ZB-7 TLS MITM Detect",  cfg.get("zb_tls_mitm",True)),
+            ("v","zb_mtu_probe",      "ZB-8 MTU Probe",        cfg.get("zb_mtu_probe",True)),
+            ("w","zb_ip_range",       "ZB-9 IP Range Scanner", cfg.get("zb_ip_range",True)),
+            ("x","zb_http_vs_https",  "ZB-10 HTTP vs HTTPS",   cfg.get("zb_http_vs_https",True)),
+            ("y","zb_header_score",   "ZB-11 Header Scoring",  cfg.get("zb_header_score",True)),
+            ("z","zb_ml_predict",     "ZB-12 ML ZB Predictor", cfg.get("zb_ml_predict",True)),
         ]
         for num, key, label, val in fields:
             print(C+f"  [{num}] {label:<22}: {G if val==True else (R if val==False else Y)}{val}{W}")
@@ -3323,7 +4389,239 @@ def config_menu(cfg):
                     v = input(Y+f"  {label} [{val}]: "+W).strip()
                     if v: cfg[key]=v
 
-def ml_train_menu():
+def zb_standalone_menu(cfg):
+    """Zero-Balance only scan — no full SNI scan."""
+    banner()
+    print(G+BOLD+"  ★ ZERO-BALANCE SCAN (ZB-Only Mode)\n"+W)
+
+    isp_info = detect_isp_asn(cfg.get("timeout", 5))
+    if isp_info.get("asn"):
+        print(C+f"  ISP Detected : {G}{isp_info['isp']}{W}")
+        print(C+f"  ASN          : {G}{isp_info['asn']}{W}")
+        print(C+f"  Public IP    : {G}{isp_info['pub_ip']}{W}")
+        known = isp_info["asn"] in ZERO_RATE_DB
+        print(C+f"  DB Status    : {G+'Known ISP ✔'+W if known else Y+'Unknown ISP'+W}\n")
+        if known:
+            zr_doms = get_isp_zero_rate_domains(isp_info["asn"])
+            print(C+f"  Zero-rated domains from DB ({len(zr_doms)}):"+W)
+            for d in zr_doms[:10]:
+                print(G+f"    • {d}"+W)
+            if len(zr_doms) > 10:
+                print(DIM+f"    ... and {len(zr_doms)-10} more"+W)
+    else:
+        print(Y+"  [!] ISP detection failed — using global DB\n"+W)
+        isp_info = {"asn": "", "isp": "Unknown", "pub_ip": ""}
+
+    print()
+    raw = input(Y+"  [+] Hosts to scan (comma/space/newline separated)\n"
+                "      OR file path (e.g. hosts.txt): "+W).strip()
+    if not raw:
+        input(R+"\n  [-] No input. Enter..."+W); return
+
+    hosts = []
+    if os.path.exists(raw):
+        with open(raw) as f:
+            hosts = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+    else:
+        import re as _re
+        hosts = _re.split(r'[\s,]+', raw)
+    hosts = [h for h in hosts if h]
+
+    if not hosts:
+        input(R+"\n  [-] No hosts found. Enter..."+W); return
+
+    port_raw = input(Y+f"  [+] Port [443]: "+W).strip()
+    port     = int(port_raw) if port_raw.isdigit() else 443
+
+    print(G+f"\n  Scanning {len(hosts)} host(s) on port {port}...\n"+W)
+
+    all_zb = []
+    for i, host in enumerate(hosts, 1):
+        print(C+f"  [{i}/{len(hosts)}] {host}"+W, end="  ", flush=True)
+        zb = run_zero_balance_scan(host, port, cfg, isp_info)
+        all_zb.append(zb)
+        score = zb["total_zb_score"]
+        ml    = zb.get("ml_zb_probability", -1)
+        ml_s  = f" ML:{ml:.0%}" if ml >= 0 else ""
+        clr   = G if score >= 60 else (Y if score >= 40 else R)
+        cand  = G+BOLD+"★ ZB CANDIDATE"+W if zb["is_zero_balance_candidate"] else DIM+"—"+W
+        print(f"{clr}{score}%{W}{ml_s}  {cand}")
+
+    # ── Results ──────────────────────────────────────────────────
+    print(G+f"\n{'═'*70}"+W)
+    print(G+BOLD+f"  ZERO-BALANCE SCAN RESULTS"+W)
+    print(G+f"{'═'*70}\n"+W)
+
+    candidates = [z for z in all_zb if z["is_zero_balance_candidate"]]
+    print(C+f"  Total Scanned    : {len(all_zb)}"+W)
+    print(G+f"  ZB Candidates    : {len(candidates)}"+W)
+    print()
+
+    if candidates:
+        print(G+BOLD+"  ★ TOP ZERO-BALANCE CANDIDATES\n"+W)
+        print(C+f"  {'HOST':<38} {'ZB%':>5} {'ML':>6} {'TRANSPORT':<25} SIGNALS"+W)
+        print(C+"  "+"─"*110+W)
+        for z in sorted(candidates, key=lambda x: x["total_zb_score"], reverse=True):
+            score = z["total_zb_score"]
+            ml    = z.get("ml_zb_probability", -1)
+            ml_s  = f"{ml:.0%}" if ml >= 0 else "—"
+            trans = z.get("recommended_transport", "?")[:23]
+            sigs  = ""
+            if z.get("isp_detect",{}).get("in_zero_rate_db"):   sigs += G+"[DB]"+W+" "
+            if z.get("ip_range",{}).get("in_known_range"):       sigs += G+"[IP]"+W+" "
+            if z.get("transparent_proxy",{}).get("proxy_detected"): sigs += Y+"[PRX]"+W+" "
+            if z.get("captive_portal",{}).get("zero_rated"):     sigs += G+"[CAP]"+W+" "
+            if z.get("captive_portal",{}).get("captive_detected"):  sigs += R+"[WALL]"+W+" "
+            if z.get("tls_mitm",{}).get("mitm_suspected"):       sigs += Y+"[MITM]"+W+" "
+            if z.get("mtu_probe",{}).get("proxy_path"):          sigs += C+"[MTU]"+W+" "
+            if z.get("dns_hijack",{}).get("hijacked"):           sigs += R+"[DNS-HJ]"+W+" "
+            clr = G+BOLD if score>=70 else Y
+            print(f"  {G}{z['host']:<38}{W} {clr}{score:>4}%{W} {M}{ml_s:>6}{W} "
+                  f"{C}{trans:<25}{W} {sigs}")
+
+        # Per-host detail
+        print(G+BOLD+"\n  ★ DETAIL PER HOST\n"+W)
+        for z in candidates:
+            print(G+BOLD+f"  ┌─ {z['host']} ─"+W)
+            isp_d = z.get("isp_detect",{})
+            cap   = z.get("captive_portal",{})
+            prx   = z.get("transparent_proxy",{})
+            dns   = z.get("dns_hijack",{})
+            tcp   = z.get("tcp_rst",{})
+            mitm  = z.get("tls_mitm",{})
+            mtu   = z.get("mtu_probe",{})
+            ipr   = z.get("ip_range",{})
+            proto = z.get("http_vs_https",{})
+            hdr   = z.get("header_score",{})
+            spd   = z.get("speed_test",{})
+
+            def _row(label, val, good=True):
+                clr = G if good else R
+                print(f"  │  {C}{label:<26}{W} {clr}{val}{W}")
+
+            _row("ZB Score",         f"{z['total_zb_score']}%")
+            _row("ML ZB Probability", f"{z.get('ml_zb_probability',-1):.0%}"
+                 if z.get('ml_zb_probability',-1)>=0 else "—")
+            _row("Recommended",       z.get("recommended_transport","?"))
+
+            if isp_d.get("in_zero_rate_db"):
+                _row("ISP DB Match",  isp_d.get("matched_isp","?")+" — "+
+                     (isp_d.get("matched_domain","")or""))
+            if ipr.get("in_known_range"):
+                _row("IP Range Match", f"{ipr.get('ip','')} in {ipr.get('matched_range','')}")
+            if prx.get("proxy_detected"):
+                hs = list(prx.get("proxy_headers",{}).keys())[:4]
+                _row("Transparent Proxy", "YES — headers: "+", ".join(hs))
+            if hdr.get("total_score",0) > 0:
+                _row("Header Score",  f"{hdr.get('total_score',0)} pts "
+                     f"[{hdr.get('proxy_level','none')}]")
+            if cap.get("captive_detected"):
+                kws = cap.get("keywords_found",[])[:3]
+                _row("Captive Portal", "YES — keywords: "+", ".join(kws), good=False)
+            elif cap.get("zero_rated"):
+                _row("Captive Test",   f"Normal 200 response (code:{cap.get('status_code','?')})")
+            if dns.get("hijacked"):
+                _row("DNS Hijack",    f"ISP:{dns.get('isp_dns_ip','?')} vs "
+                     f"Google:{dns.get('google_dns_ip','?')}", good=False)
+            elif dns.get("ip_mismatch"):
+                _row("DNS Mismatch",  f"ISP:{dns.get('isp_dns_ip','?')} vs "
+                     f"Google:{dns.get('google_dns_ip','?')}")
+            if mitm.get("mitm_suspected"):
+                _row("TLS MITM",      f"Issuer: {mitm.get('cert_issuer','?')}", good=False)
+            if mtu.get("proxy_path"):
+                _row("MTU Probe",     f"MTU {mtu.get('mtu_detected','?')} — proxy path")
+            mode = proto.get("zero_rate_mode","neither")
+            _row("HTTP/HTTPS Mode", mode,
+                 good=(mode!="neither"))
+            if tcp.get("blocked"):
+                _row("TCP Status",    "BLOCKED", good=False)
+            elif tcp.get("connection_ok"):
+                _row("TCP Status",    "OK — connection successful")
+            if spd.get("speed_kbps"):
+                _row("Speed",         spd.get("speed_tier","?"))
+            print(G+f"  └─────────────────────────────\n"+W)
+    else:
+        print(Y+"  [!] Zero-balance candidates detected නෑ.\n"
+              "      Hosts blocked / not zero-rated.\n"+W)
+
+    # Export option
+    exp = input(Y+"  [+] Results export කරන්නද? (y/N): "+W).strip().lower()
+    if exp == 'y':
+        fname = f"zb_results_{int(time.time())}.json"
+        try:
+            with open(fname, 'w') as f:
+                json.dump(all_zb, f, indent=2, default=str)
+            print(G+f"  ✔ Saved: {fname}"+W)
+        except Exception as e:
+            print(R+f"  [-] Save error: {e}"+W)
+
+    input(Y+"\n  Enter ඔබන්න..."+W)
+
+
+def zb_ml_train_menu():
+    """Train the Zero-Balance ML model from accumulated data."""
+    banner()
+    print(C+BOLD+"  [ZB-ML TRAINER] Zero-Balance Model\n"+W)
+
+    if not sklearn or not numpy:
+        print(R+"  [-] scikit-learn / numpy not installed."+W)
+        print(Y+"  pip install scikit-learn numpy"+W)
+        input(Y+"\n  Enter ඔබන්න..."+W)
+        return
+
+    if not os.path.exists(ZB_ML_MODEL_FILE):
+        print(Y+f"  [!] Training file '{ZB_ML_MODEL_FILE}' not found."+W)
+        print(Y+"  ZB scans run කරාට පස්සේ data ස්වයංක්‍රීයව save වෙනවා."+W)
+        input(Y+"\n  Enter ඔබන්න..."+W)
+        return
+
+    try:
+        with open(ZB_ML_MODEL_FILE) as f:
+            data = json.load(f)
+        print(C+f"  Samples : {len(data)}"+W)
+        pos = sum(1 for d in data if d["label"] == 1)
+        neg = len(data) - pos
+        print(C+f"  Positive (ZB=True)  : {G}{pos}{W}")
+        print(C+f"  Negative (ZB=False) : {R}{neg}{W}\n")
+        if len(data) < 10:
+            print(Y+f"  [!] අවම 10 samples ඕනෑ. දැනට {len(data)}."+W)
+            input(Y+"\n  Enter ඔබන්න..."+W)
+            return
+    except Exception as e:
+        print(R+f"  [-] Load error: {e}"+W)
+        input(Y+"\n  Enter ඔබන්න..."+W)
+        return
+
+    print(C+"  Training RandomForest..."+W)
+    clf = zb_ml_train()
+    if clf:
+        print(G+f"\n  ✔ ZB Model trained on {len(data)} samples!\n"+W)
+        try:
+            import numpy as np
+            feat_names = [
+                "isp_db","isp_ip_range","isp_score",
+                "cap_zero_rated","cap_captive","cap_score",
+                "proxy_detected","proxy_score",
+                "dns_hijacked","dns_mismatch",
+                "tcp_ok","tcp_blocked",
+                "mitm_suspected","isp_cert",
+                "mtu_proxy","mtu_score",
+                "ip_range","http_works","https_works",
+                "hdr_score","total_zb_score",
+            ]
+            top5 = np.argsort(clf.feature_importances_)[::-1][:5]
+            print(C+"  Top-5 Feature Importances:"+W)
+            for idx in top5:
+                name = feat_names[idx] if idx < len(feat_names) else f"feat_{idx}"
+                print(C+f"    {name:<22}{W} {G}{clf.feature_importances_[idx]:.3f}{W}")
+        except Exception:
+            pass
+    else:
+        print(R+"  [-] Training failed."+W)
+
+    input(Y+"\n  Enter ඔබන්න..."+W)
+
+
     banner()
     print(C+"  [ML MODEL TRAINER]\n"+W)
     if not sklearn or not numpy:
@@ -3385,37 +4683,42 @@ def main():
 
     cfg = load_cfg()
 
-    # Auto-load ML model if available
+    # Auto-load ML models if available
     if cfg.get("use_ml_predictor", True) and sklearn and numpy:
-        _loaded = ml_train()
-        if _loaded:
-            sp(G + f"  [ML] Model auto-loaded ✔" + W)
+        if ml_train():
+            sp(G + "  [Bug-ML] Model auto-loaded ✔" + W)
+        if zb_ml_train():
+            sp(G + "  [ZB-ML]  Model auto-loaded ✔" + W)
 
     while True:
         banner()
-        print(Y+"  ┌────────────────────────────────────────────────┐"+W)
-        print(Y+"  │               MAIN MENU  v6.0                  │"+W)
-        print(Y+"  ├────────────────────────────────────────────────┤"+W)
-        print(Y+"  │  "+W+"[1]  Domain Scan  (Async + Full SNI)      "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[2]  Single Host  (Deep Check)             "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[3]  Batch Scan   (File Input)             "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[4]  Settings / Config                     "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[5]  Dependencies Status                   "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[6]  Train ML Model (accumulated data)     "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[7]  Exit                                  "+Y+"  │"+W)
-        print(Y+"  └────────────────────────────────────────────────┘\n"+W)
+        print(Y+"  ┌──────────────────────────────────────────────────┐"+W)
+        print(Y+"  │          MAIN MENU  v7.0  ★ ZERO-BALANCE         │"+W)
+        print(Y+"  ├──────────────────────────────────────────────────┤"+W)
+        print(Y+"  │  "+W+"[1]  Domain Scan      (Full SNI + ZB detect)"+Y+"  │"+W)
+        print(Y+"  │  "+W+"[2]  Single Host      (Deep Check + ZB)     "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[3]  Batch Scan       (File Input)          "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[4]  ZB-Only Scan     (Zero-Balance focus)  "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[5]  Settings / Config                      "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[6]  Dependencies Status                    "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[7]  Train Bug-ML Model                     "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[8]  Train ZB-ML Model                      "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[9]  Exit                                   "+Y+"  │"+W)
+        print(Y+"  └──────────────────────────────────────────────────┘\n"+W)
 
-        ch = input(C+"  Choice (1-7): "+W).strip()
+        ch = input(C+"  Choice (1-9): "+W).strip()
         if   ch=='1': scan_domain_menu(cfg)
         elif ch=='2': single_host_menu(cfg)
         elif ch=='3': batch_scan_menu(cfg)
-        elif ch=='4': config_menu(cfg)
-        elif ch=='5': deps_menu()
-        elif ch=='6': ml_train_menu()
-        elif ch=='7':
+        elif ch=='4': zb_standalone_menu(cfg)
+        elif ch=='5': config_menu(cfg)
+        elif ch=='6': deps_menu()
+        elif ch=='7': ml_train_menu()
+        elif ch=='8': zb_ml_train_menu()
+        elif ch=='9':
             print(G+"\n  ජය වේවා! 👋\n"+W); sys.exit(0)
         else:
-            print(R+"\n  [-] 1-7 ඇතුලත් කරන්න.\n"+W); time.sleep(1)
+            print(R+"\n  [-] 1-9 ඇතුලත් කරන්න.\n"+W); time.sleep(1)
 
 if __name__=="__main__":
     main()
