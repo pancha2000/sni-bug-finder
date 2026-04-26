@@ -4837,6 +4837,605 @@ def zb_ml_train_menu():
     input(Y+"\n  Enter ඔබන්න..."+W)
 
 
+def smart_unified_scan(cfg):
+    """
+    ★ SMART UNIFIED SCAN
+    Domain + ISP input → auto-run everything → best host + config output.
+
+    Pipeline:
+      1. ISP detect / select
+      2. Subdomain discovery (crt.sh + brute)
+      3. SNI mismatch test with ISP zero-rated SNIs
+      4. IP range scan (CDN ranges for that domain)
+      5. ZB detection (ISP-specific)
+      6. Transport benchmark (all methods)
+      7. Score everything → winner select
+      8. Complete config generate
+    """
+    banner()
+    print(G+BOLD+"""
+  ╔══════════════════════════════════════════════════════════╗
+  ║   ★  SMART UNIFIED SCAN  —  One Input → Best Result  ★  ║
+  ╚══════════════════════════════════════════════════════════╝
+"""+W)
+
+    # ── Step 0: ISP Selection ─────────────────────────────────────
+    ISP_LIST = [
+        ("Dialog",  "AS9329",  ["zoom.us","wa.me","free.facebook.com","web.whatsapp.com"]),
+        ("Mobitel", "AS17639", ["zoom.us","wa.me","free.facebook.com","web.whatsapp.com"]),
+        ("Hutch",   "AS24616", ["wa.me","free.facebook.com","youtube.com","web.whatsapp.com"]),
+        ("SLT",     "AS9270",  ["zoom.us","wa.me","free.facebook.com","web.whatsapp.com"]),
+    ]
+    ISP_PORTS = {
+        "Dialog":  [443, 80, 8080, 8443, 2053, 2083, 2087, 2096],
+        "Mobitel": [443, 80, 2060, 2086, 8080, 8443, 2053, 2096],
+        "Hutch":   [443, 80, 8080, 8443, 2053],
+        "SLT":     [443, 80, 8080, 8443, 2053, 2083],
+    }
+
+    print(C+"  ┌─ Step 1: ISP Selection ───────────────────────────┐"+W)
+    print(C+"  │"+W)
+
+    # Auto-detect first
+    isp_auto = detect_isp_asn(cfg.get("timeout", 5))
+    auto_isp = None
+    for name, asn, _ in ISP_LIST:
+        if asn == isp_auto.get("asn"):
+            auto_isp = name
+            break
+
+    if auto_isp:
+        print(C+f"  │  {G}Auto-detected: {auto_isp} ({isp_auto.get('isp','')}){W}")
+    else:
+        print(C+f"  │  {DIM}ISP auto-detect: {isp_auto.get('isp','Unknown')}{W}")
+
+    print(C+"  │"+W)
+    for i, (name, asn, _) in enumerate(ISP_LIST, 1):
+        marker = G+" ← detected"+W if name == auto_isp else ""
+        print(C+f"  │  {W}[{i}] {G}{name:<10}{W} {DIM}({asn}){W}{marker}")
+    print(C+"  └──────────────────────────────────────────────────┘"+W)
+
+    isp_ch = input(C+f"\n  ISP (1-4, Enter={auto_isp or 'Unknown'}): "+W).strip()
+    try:
+        isp_name, isp_asn, isp_snis = ISP_LIST[int(isp_ch)-1]
+    except Exception:
+        if auto_isp:
+            isp_name, isp_asn, isp_snis = next(
+                (x for x in ISP_LIST if x[0]==auto_isp), ISP_LIST[0])
+        else:
+            isp_name, isp_asn, isp_snis = ISP_LIST[0]
+
+    isp_ports = ISP_PORTS.get(isp_name, [443, 80, 8080])
+    print(G+f"\n  ✔ ISP: {isp_name} | Ports: {', '.join(str(p) for p in isp_ports[:5])}...\n"+W)
+
+    # ── Step 1: Domain Input ──────────────────────────────────────
+    print(C+"  ┌─ Step 2: Target Domain ───────────────────────────┐"+W)
+    print(C+"  │  "+W+f"Known zero-rated: {G}{', '.join(isp_snis[:3])}{W}")
+    print(C+"  └──────────────────────────────────────────────────┘"+W)
+
+    domain_raw = input(Y+"\n  Domain (e.g. zoom.us, wa.me): "+W).strip().lower()
+    if not domain_raw:
+        print(R+"  [-] Domain ඇතුලත් කරන්න."+W)
+        input(Y+"\n  Enter..."+W); return
+
+    # Strip protocol
+    domain = re.sub(r'^https?://', '', domain_raw).split('/')[0]
+    timeout = cfg.get("timeout", 5)
+
+    print(G+f"\n  Target   : {domain}"+W)
+    print(G+f"  ISP      : {isp_name}"+W)
+    print(G+f"  Ports    : {isp_ports[:5]}\n"+W)
+
+    # ══════════════════════════════════════════════════════════════
+    # PHASE 1: Subdomain Discovery
+    # ══════════════════════════════════════════════════════════════
+    print(C+BOLD+"\n  ═══ PHASE 1: Subdomain Discovery ═══\n"+W)
+
+    subdomains = [domain]  # always include base domain
+
+    # crt.sh
+    print(C+"  [1/3] crt.sh Certificate Transparency..."+W, end=" ", flush=True)
+    try:
+        crt_subs = fetch_crtsh(domain, timeout=15)
+        subdomains.extend(crt_subs)
+        print(G+f"{len(crt_subs)} found"+W)
+    except Exception:
+        print(Y+"skip"+W)
+
+    # DNS brute-force (fast subset)
+    print(C+"  [2/3] DNS brute-force (fast)..."+W, end=" ", flush=True)
+    FAST_WORDLIST = [
+        "www","mail","ftp","api","cdn","static","media","img","video",
+        "us","us02web","us04web","us06web","us08web",
+        "zoom","meet","join","app","web","mobile","m",
+        "blog","docs","help","support","dev","staging",
+        "dl","download","content","assets","files",
+    ]
+    brute_subs = []
+    def _resolve(sub):
+        try:
+            socket.gethostbyname(f"{sub}.{domain}")
+            return f"{sub}.{domain}"
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        futs = {ex.submit(_resolve, s): s for s in FAST_WORDLIST}
+        for fut in as_completed(futs):
+            r = fut.result()
+            if r:
+                brute_subs.append(r)
+    subdomains.extend(brute_subs)
+    print(G+f"{len(brute_subs)} found"+W)
+
+    # AlienVault
+    print(C+"  [3/3] AlienVault OTX..."+W, end=" ", flush=True)
+    try:
+        av_subs = fetch_alienvault(domain, timeout=10)
+        subdomains.extend(av_subs)
+        print(G+f"{len(av_subs)} found"+W)
+    except Exception:
+        print(Y+"skip"+W)
+
+    # Deduplicate
+    subdomains = list(dict.fromkeys(s.strip().lower() for s in subdomains if s))
+    print(G+f"\n  ★ Total unique hosts: {len(subdomains)}\n"+W)
+
+    if not subdomains:
+        print(R+"  [-] Hosts not found."+W)
+        input(Y+"\n  Enter..."+W); return
+
+    # ══════════════════════════════════════════════════════════════
+    # PHASE 2: SNI + Bug Host Scan
+    # ══════════════════════════════════════════════════════════════
+    print(C+BOLD+"\n  ═══ PHASE 2: SNI + Bug Host Scan ═══\n"+W)
+
+    # Use ISP zero-rated SNIs as bug_sni candidates
+    bug_sni = isp_snis[0]
+    print(C+f"  Bug SNI candidates: {G}{', '.join(isp_snis[:4])}{W}")
+    print(C+f"  Scanning {len(subdomains)} hosts (threads:{cfg['threads']})...\n"+W)
+
+    # Quick scan mode — key methods only for speed
+    scan_cfg = {**cfg,
+        "check_open_knock": False,  # skip slow methods
+        "check_conn_state": False,
+        "check_ech_real":   False,
+        "check_wtfpad":     False,
+        "check_sctp_probe": False,
+        "check_quic_real":  False,
+        "check_pkt_manip":  False,
+        "zb_speed_diff":    False,
+    }
+
+    # Build ISP-specific SNI test list
+    scan_cfg["_extra_snis"] = isp_snis
+
+    scan_results = run_scan(subdomains, scan_cfg, bug_sni, domain)
+
+    bugs     = [r for r in scan_results if r["is_bug_host"]]
+    zb_cands = [r for r in scan_results
+                if r.get("zero_balance",{}).get("is_zero_balance_candidate")]
+
+    print(G+f"\n  ★ Bug hosts found    : {len(bugs)}"+W)
+    print(G+f"  ★ ZB candidates      : {len(zb_cands)}"+W)
+
+    # ══════════════════════════════════════════════════════════════
+    # PHASE 3: IP Range Hunt (fastest IPs)
+    # ══════════════════════════════════════════════════════════════
+    print(C+BOLD+"\n  ═══ PHASE 3: IP Range Speed Hunt ═══\n"+W)
+
+    # Determine which IP ranges to scan based on domain
+    DOMAIN_RANGES = {
+        "zoom.us":          ["Zoom-CDN", "Zoom-AWS"],
+        "zoom":             ["Zoom-CDN", "Zoom-AWS"],
+        "facebook.com":     ["Facebook-Free"],
+        "fbcdn.net":        ["Facebook-Free"],
+        "whatsapp.com":     ["WhatsApp"],
+        "whatsapp.net":     ["WhatsApp"],
+        "wa.me":            ["WhatsApp"],
+        "cloudflare.com":   ["Cloudflare-Asia", "Cloudflare-Global"],
+        "1.1.1.1":          ["Cloudflare-Asia", "Cloudflare-Global"],
+    }
+
+    range_keys = []
+    for key, rkeys in DOMAIN_RANGES.items():
+        if key in domain:
+            range_keys = rkeys
+            break
+    if not range_keys:
+        range_keys = ["Cloudflare-Asia"]  # default fallback
+
+    top_ips = []
+    if _SPEED_HUNTER_OK:
+        from sni_speed_hunter import (
+            run_ip_range_hunter, IP_RANGE_DB,
+            benchmark_all_transports, generate_3xui_config,
+            format_3xui_panel, ISP_PROFILES,
+        )
+        isp_profile = ISP_PROFILES.get(isp_name, ISP_PROFILES["Unknown"])
+
+        for rk in range_keys:
+            if rk not in IP_RANGE_DB:
+                continue
+            print(C+f"  Scanning: {rk}"+W)
+            ips = run_ip_range_hunter(
+                rk,
+                sni=domain,
+                isp_key=isp_name,
+                timeout=min(timeout, 3),
+                max_ips=20,
+                threads=40,
+                do_transport_test=True,
+            )
+            top_ips.extend(ips)
+
+        top_ips.sort(key=lambda x: x.get("lat_ms") or 9999)
+        print(G+f"\n  ★ Fastest IPs found: {len(top_ips)}\n"+W)
+    else:
+        print(Y+"  [!] Speed Hunter not available — IP range scan skip\n"+W)
+
+    # ══════════════════════════════════════════════════════════════
+    # PHASE 4: ZB Deep Analysis on top candidates
+    # ══════════════════════════════════════════════════════════════
+    print(C+BOLD+"\n  ═══ PHASE 4: Zero-Balance Deep Analysis ═══\n"+W)
+
+    isp_info_for_zb = {"asn": isp_asn, "isp": isp_name, "pub_ip": ""}
+    zb_deep_results = []
+
+    # Run ZB on top bug hosts + top IPs
+    zb_targets = []
+    for r in bugs[:5]:
+        zb_targets.append((r["host"], r.get("ip") or r["host"]))
+    for ip_r in top_ips[:3]:
+        if ip_r.get("ip"):
+            zb_targets.append((ip_r["ip"], ip_r["ip"]))
+
+    for host, ip in zb_targets:
+        print(C+f"  ZB testing: {host}..."+W, end=" ", flush=True)
+        zb = run_zero_balance_scan(host, 443, cfg, isp_info_for_zb)
+        zb["_ip"]   = ip
+        zb["_host"] = host
+        zb_deep_results.append(zb)
+        score = zb["total_zb_score"]
+        cand  = G+BOLD+"★ ZB!" +W if zb["is_zero_balance_candidate"] else DIM+"—"+W
+        print(f"{G if score>=60 else Y}{score}%{W}  {cand}")
+
+    # ══════════════════════════════════════════════════════════════
+    # PHASE 5: Transport Benchmark on winners
+    # ══════════════════════════════════════════════════════════════
+    print(C+BOLD+"\n  ═══ PHASE 5: Transport Speed Benchmark ═══\n"+W)
+
+    bench_results = []
+
+    # Benchmark top bug hosts
+    if _SPEED_HUNTER_OK:
+        bench_targets = []
+        for r in bugs[:3]:
+            bench_targets.append((r["host"], r.get("ip") or r["host"]))
+        for ip_r in top_ips[:3]:
+            if ip_r.get("ip"):
+                bench_targets.append((ip_r["ip"], ip_r["ip"]))
+
+        for host, ip in bench_targets:
+            print(C+f"  Benchmarking: {host} ({ip})..."+W, end=" ", flush=True)
+            try:
+                bench = benchmark_all_transports(
+                    ip, domain, isp_ports[:6], timeout, isp_profile)
+                winner = bench.get("winner","none")
+                score  = bench.get("winner_score", 0)
+                wclr   = G+BOLD if score>=60 else (Y if score>=30 else R)
+                print(f"{wclr}{winner}{W} score:{score}")
+                bench_results.append({
+                    "host":  host,
+                    "ip":    ip,
+                    "bench": bench,
+                })
+            except Exception as e:
+                print(R+f"error: {e}"+W)
+    else:
+        # Fallback: use scan results transport info
+        for r in bugs[:3]:
+            m = r.get("sni_methods", {})
+            transport = (
+                "gRPC:443" if m.get("grpc_stream",{}).get("works") else
+                "WS+TLS:443" if m.get("ws_real_payload",{}).get("works") else
+                "SplitHTTP:443" if m.get("xhttp_test",{}).get("works") else
+                "TCP+TLS:443"
+            )
+            bench_results.append({
+                "host":  r["host"],
+                "ip":    r.get("ip",""),
+                "bench": {"winner": transport, "winner_score": r["bug_score"],
+                           "transports": {}},
+            })
+
+    # ══════════════════════════════════════════════════════════════
+    # FINAL: Unified Scoring + Best Host Select
+    # ══════════════════════════════════════════════════════════════
+    print(C+BOLD+"\n\n  ══════════════════════════════════════════════════════"+W)
+    print(G+BOLD+"  ★★★  SMART SCAN RESULTS  ★★★"+W)
+    print(C+BOLD+"  ══════════════════════════════════════════════════════\n"+W)
+
+    # Build unified candidate list
+    candidates = []
+
+    for r in bugs:
+        ip     = r.get("ip","")
+        host   = r["host"]
+        bug_sc = r["bug_score"]
+
+        # Find ZB score
+        zb_match = next((z for z in zb_deep_results if z.get("_host")==host), {})
+        zb_sc    = zb_match.get("total_zb_score", 0)
+        zb_cand  = zb_match.get("is_zero_balance_candidate", False)
+
+        # Find transport benchmark
+        bench_match = next((b for b in bench_results if b["host"]==host), {})
+        bench       = bench_match.get("bench", {})
+        winner      = bench.get("winner", "")
+        tr_score    = bench.get("winner_score", 0)
+
+        # Find IP speed
+        ip_match    = next((x for x in top_ips if x.get("ip")==ip), {})
+        ip_lat      = ip_match.get("lat_ms", 999)
+
+        # Composite score
+        composite = (bug_sc * 0.35) + (zb_sc * 0.30) + (tr_score * 0.25) + max(0, (100 - ip_lat) * 0.10)
+
+        candidates.append({
+            "host":      host,
+            "ip":        ip,
+            "bug_score": bug_sc,
+            "zb_score":  zb_sc,
+            "zb_cand":   zb_cand,
+            "tr_winner": winner,
+            "tr_score":  tr_score,
+            "ip_lat":    ip_lat,
+            "composite": round(composite, 1),
+            "scan_r":    r,
+            "zb_r":      zb_match,
+            "bench":     bench,
+        })
+
+    # Also add top IP results
+    for ip_r in top_ips[:3]:
+        ip   = ip_r.get("ip","")
+        host = ip
+
+        zb_match = next((z for z in zb_deep_results if z.get("_ip")==ip), {})
+        zb_sc    = zb_match.get("total_zb_score", 0)
+
+        bench_match = next((b for b in bench_results if b["ip"]==ip), {})
+        bench       = bench_match.get("bench", ip_r.get("transport_bench",{}))
+        winner      = bench.get("winner","")
+        tr_score    = bench.get("winner_score", 0)
+        ip_lat      = ip_r.get("lat_ms", 999)
+
+        composite = (50 * 0.35) + (zb_sc * 0.30) + (tr_score * 0.25) + max(0,(100-ip_lat)*0.10)
+
+        candidates.append({
+            "host":      host,
+            "ip":        ip,
+            "bug_score": 50,
+            "zb_score":  zb_sc,
+            "zb_cand":   zb_match.get("is_zero_balance_candidate", False),
+            "tr_winner": winner,
+            "tr_score":  tr_score,
+            "ip_lat":    ip_lat,
+            "composite": round(composite, 1),
+            "scan_r":    None,
+            "zb_r":      zb_match,
+            "bench":     bench,
+        })
+
+    candidates.sort(key=lambda x: x["composite"], reverse=True)
+
+    # ── Summary Table ─────────────────────────────────────────────
+    print(C+f"  {'HOST/IP':<38} {'BUG':>5} {'ZB':>5} {'TRANSPORT':<22} {'LAT':>6} {'★SCORE':>7}"+W)
+    print(C+"  "+"─"*90+W)
+
+    for c in candidates[:10]:
+        bclr = G+BOLD if c["bug_score"]>=70 else (Y if c["bug_score"]>=50 else DIM)
+        zclr = G+BOLD if c["zb_score"]>=60  else (Y if c["zb_score"]>=40  else R)
+        tclr = G if c["tr_score"]>=60 else (Y if c["tr_score"]>=30 else DIM)
+        sclr = G+BOLD if c["composite"]>=60 else (Y if c["composite"]>=40 else R)
+        lat  = f"{c['ip_lat']}ms" if c["ip_lat"] < 999 else "—"
+        zb_s = G+"[ZB★]"+W if c["zb_cand"] else ""
+        print(f"  {G}{c['host']:<38}{W} "
+              f"{bclr}{c['bug_score']:>4}%{W} "
+              f"{zclr}{c['zb_score']:>4}%{W} "
+              f"{tclr}{c['tr_winner']:<22}{W} "
+              f"{Y}{lat:>6}{W} "
+              f"{sclr}{c['composite']:>6}{W} {zb_s}")
+
+    # ── WINNER ────────────────────────────────────────────────────
+    if not candidates:
+        print(R+"\n  [-] Working host not found. Try different domain/ISP.\n"+W)
+        input(Y+"  Enter..."+W); return
+
+    winner_c = candidates[0]
+    print(G+BOLD+f"""
+  ╔══════════════════════════════════════════════════════════╗
+  ║  ★ WINNER HOST                                          ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  Host      : {winner_c['host']:<44}║
+  ║  IP        : {winner_c['ip']:<44}║
+  ║  Transport : {winner_c['tr_winner']:<44}║
+  ║  Bug Score : {str(winner_c['bug_score'])+'%':<44}║
+  ║  ZB Score  : {str(winner_c['zb_score'])+'%' + (' ★ ZB CANDIDATE!' if winner_c['zb_cand'] else ''):<44}║
+  ║  Latency   : {str(winner_c['ip_lat'])+'ms' if winner_c['ip_lat']<999 else 'N/A':<44}║
+  ║  ★ Composite: {str(winner_c['composite']):<43}║
+  ╚══════════════════════════════════════════════════════════╝
+"""+W)
+
+    # ── Zero-Balance Detail ───────────────────────────────────────
+    zb = winner_c.get("zb_r", {})
+    if zb and zb.get("total_zb_score", 0) > 0:
+        print(C+BOLD+"  ZERO-BALANCE SIGNALS:\n"+W)
+        if zb.get("isp_detect",{}).get("in_zero_rate_db"):
+            print(G+f"  ✔ ISP DB: {zb['isp_detect'].get('matched_isp','')} "
+                  f"— {zb['isp_detect'].get('matched_domain','')}"+W)
+        if zb.get("ip_range",{}).get("in_known_range"):
+            print(G+f"  ✔ IP Range: {zb['ip_range'].get('matched_range','')} "
+                  f"({zb['ip_range'].get('matched_service','')})" +W)
+        if zb.get("transparent_proxy",{}).get("proxy_detected"):
+            print(Y+"  ✔ Transparent Proxy detected"+W)
+        if zb.get("mtu_probe",{}).get("proxy_path"):
+            print(Y+f"  ✔ MTU probe: {zb['mtu_probe'].get('mtu_detected','')} "
+                  f"(proxy path)"+W)
+        proto_mode = zb.get("http_vs_https",{}).get("zero_rate_mode","?")
+        print(C+f"  ✔ Protocol mode: {proto_mode}"+W)
+        rec = zb.get("recommended_transport","?")
+        print(G+f"  ✔ Recommended transport: {rec}"+W)
+        ml_z = zb.get("ml_zb_probability",-1)
+        if ml_z >= 0:
+            print(M+f"  ✔ ML ZB Probability: {ml_z:.0%}"+W)
+        print()
+
+    # ── Generate Configs for ALL transports ──────────────────────
+    print(C+BOLD+"  ═══ GENERATED CONFIGS ═══\n"+W)
+
+    host       = winner_c["host"]
+    ip         = winner_c["ip"] or host
+    bench      = winner_c.get("bench", {})
+    scan_r     = winner_c.get("scan_r")
+    all_trans  = bench.get("transports", {})
+
+    # Collect transports to show
+    show_transports = {}
+
+    # From Speed Hunter benchmark
+    for tk, tv in sorted(all_trans.items(),
+                         key=lambda x: x[1].get("score",0), reverse=True)[:4]:
+        if tv.get("score",0) > 0 or tv.get("works"):
+            show_transports[tk] = tv
+
+    # From SNI scan (fallback / additional)
+    if scan_r:
+        m = scan_r.get("sni_methods", {})
+        op = scan_r.get("open_ports", {})
+        if m.get("grpc_stream",{}).get("works") and "gRPC:443" not in show_transports:
+            p, _ = _best_port(op, True)
+            show_transports[f"gRPC:{p}"] = {"port":p,"score":60}
+        if m.get("ws_real_payload",{}).get("works") and not any("WS" in k for k in show_transports):
+            p, _ = _best_port(op, True)
+            show_transports[f"WS+TLS:{p}"] = {"port":p,"score":50}
+        if m.get("xhttp_test",{}).get("works") and not any("Split" in k for k in show_transports):
+            p, _ = _best_port(op, True)
+            show_transports[f"SplitHTTP:{p}"] = {"port":p,"score":45}
+
+    if not show_transports:
+        # Minimal fallback
+        show_transports = {winner_c["tr_winner"] or "gRPC:443": {"port":443,"score":50}}
+
+    # Mobitel special port
+    if isp_name == "Mobitel":
+        show_transports[f"WS:2060"] = {"port":2060,"score":40,"note":"Mobitel special port ★"}
+        show_transports[f"WS:2086"] = {"port":2086,"score":35,"note":"Mobitel alt port"}
+
+    server_input = input(Y+"  VPS Server IP/domain (config generate): "+W).strip()
+    uid_input    = input(Y+"  UUID (Enter=auto-generate): "+W).strip() or None
+
+    import uuid as _uuid
+    uid = uid_input or str(_uuid.uuid4())
+    srv = server_input or ip
+
+    best_shown = False
+    for idx, (tk, tv) in enumerate(
+            sorted(show_transports.items(),
+                   key=lambda x: x[1].get("score",0), reverse=True)):
+
+        tr_parts   = tk.split(":")
+        tr_name    = tr_parts[0]
+        tr_port    = int(tr_parts[1]) if len(tr_parts)>1 and tr_parts[1].isdigit() else 443
+        tr_path    = "/"+tr_parts[2] if len(tr_parts)>2 else "/"
+        use_tls    = tr_port in [443,8443,2053,2083,2087,2096]
+        net_map    = {"gRPC":"grpc","WS+TLS":"ws","WS":"ws",
+                      "SplitHTTP":"splithttp","HTTPUpgrade":"httpupgrade","TCP+TLS":"tcp"}
+        network    = net_map.get(tr_name, "ws")
+        security   = "tls" if use_tls else "none"
+        is_winner  = not best_shown
+        hdr        = G+BOLD if is_winner else C
+        win_tag    = " ← ★ BEST SPEED" if is_winner else ""
+        best_shown = True
+
+        print(hdr+f"  ┌─ Config [{idx+1}]: {tk}{win_tag} ─{'─'*max(0,35-len(tk))}┐"+W)
+        print(C+f"  │  Remark      : {G}{host}-{tr_name}{W}")
+        print(C+f"  │  Protocol    : {G}vless{W}")
+        print(C+f"  │  Address     : {G}{srv}{W}  {DIM}(ඔයාගේ VPS){W}")
+        print(C+f"  │  Port        : {G}{tr_port}{W}")
+        print(C+f"  │  UUID        : {DIM}{uid}{W}")
+        print(C+f"  │  Network     : {G}{network}{W}")
+        if network == "grpc":
+            print(C+f"  │  gRPC Mode   : {G}multi{W}")
+            print(C+f"  │  ServiceName : {G}grpc{W}")
+        elif network in ["ws","splithttp","httpupgrade"]:
+            print(C+f"  │  Path        : {G}{tr_path}{W}")
+            print(C+f"  │  Host Header : {G}{domain}{W}")
+        print(C+f"  │  TLS         : {G if use_tls else Y}{security}{W}")
+        if use_tls:
+            print(C+f"  │  SNI         : {G}{isp_snis[0]}{W}  {DIM}(zero-rated SNI — mismatch){W}")
+            print(C+f"  │  Fingerprint : {G}chrome{W}")
+            print(C+f"  │  AllowInsec  : {G}true{W}")
+        if tv.get("note"):
+            print(Y+f"  │  ★ Note      : {tv['note']}{W}")
+        print(C+f"  └{'─'*52}┘{W}")
+
+        # Share link
+        sni_val = isp_snis[0]
+        params  = f"security={security}&sni={sni_val}&fp=chrome&type={network}&allowInsecure=1"
+        if network == "grpc":
+            params += "&serviceName=grpc&mode=multi"
+        elif network in ["ws","splithttp","httpupgrade"]:
+            params += f"&path={tr_path}&host={domain}"
+        link = f"vless://{uid}@{srv}:{tr_port}?{params}#{host}-{tr_name}-{isp_name}"
+        print(Y+f"  ▶ {link}\n"+W)
+
+    # ── ISP-specific note ─────────────────────────────────────────
+    print(C+BOLD+"  ISP NOTES:\n"+W)
+    if isp_name == "Dialog":
+        print(G+"  ✔ Dialog: gRPC + zoom.us SNI mismatch = best combo"+W)
+        print(G+"  ✔ Ports: 443, 8080, 2053 try කරන්න"+W)
+    elif isp_name == "Mobitel":
+        print(G+"  ✔ Mobitel: Port 2060 special zero-rate port"+W)
+        print(G+"  ✔ WS transport + port 2060 = Mobitel optimal"+W)
+        print(Y+"  ✔ gRPC port 443 ත් test කරන්න"+W)
+    elif isp_name == "Hutch":
+        print(G+"  ✔ Hutch: WS+TLS + youtube.com SNI = best"+W)
+    elif isp_name == "SLT":
+        print(G+"  ✔ SLT: gRPC + zoom.us/wa.me SNI = best"+W)
+
+    # ── Export ────────────────────────────────────────────────────
+    exp = input(Y+"\n  Full results export කරන්නද? (y/N): "+W).strip().lower()
+    if exp == 'y':
+        import datetime
+        ts    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"smart_scan_{domain}_{isp_name}_{ts}.json"
+        try:
+            export_data = {
+                "domain":     domain,
+                "isp":        isp_name,
+                "timestamp":  ts,
+                "winner":     {k: v for k,v in winner_c.items()
+                               if k not in ["scan_r","zb_r","bench"]},
+                "all_candidates": [{k: v for k,v in c.items()
+                                    if k not in ["scan_r","zb_r","bench"]}
+                                   for c in candidates],
+                "top_ips":    top_ips[:10],
+                "configs":    [
+                    f"vless://{uid}@{srv}:{list(show_transports.values())[0].get('port',443)}"
+                    f"?security=tls&sni={isp_snis[0]}&fp=chrome&type=grpc"
+                    f"&serviceName=grpc&mode=multi&allowInsecure=1#{host}-{isp_name}"
+                ],
+            }
+            with open(fname,'w') as f:
+                json.dump(export_data, f, indent=2, default=str)
+            print(G+f"  ✔ Saved: {fname}"+W)
+        except Exception as e:
+            print(R+f"  [-] Save error: {e}"+W)
+
+    input(Y+"\n  Enter ඔබන්න..."+W)
+
+
 def main():
     try:
         import urllib3
@@ -4858,11 +5457,13 @@ def main():
         print(Y+"  ┌──────────────────────────────────────────────────────┐"+W)
         print(Y+"  │     MAIN MENU  v8.0  ★ SPEED HUNTER EDITION         │"+W)
         print(Y+"  ├──────────────────────────────────────────────────────┤"+W)
+        print(Y+"  │  "+W+f"[S]  ★★ SMART SCAN (Domain+ISP → Best Config) ★★  "+Y+"│"+W)
+        print(Y+"  ├──────────────────────────────────────────────────────┤"+W)
         print(Y+"  │  "+W+"[1]  Domain Scan       (Full SNI + ZB)        "+Y+"  │"+W)
         print(Y+"  │  "+W+"[2]  Single Host        (Deep Check + ZB)     "+Y+"  │"+W)
         print(Y+"  │  "+W+"[3]  Batch Scan         (File Input)          "+Y+"  │"+W)
         print(Y+"  │  "+W+"[4]  ZB-Only Scan       (Zero-Balance focus)  "+Y+"  │"+W)
-        print(Y+"  │  "+W+f"[5]  ★ Speed Hunter     {sh_status:<28}"+Y+"  │"+W)
+        print(Y+"  │  "+W+f"[5]  Speed Hunter       {sh_status:<28}"+Y+"  │"+W)
         print(Y+"  │  "+W+"[6]  Settings / Config                        "+Y+"  │"+W)
         print(Y+"  │  "+W+"[7]  Dependencies Status                      "+Y+"  │"+W)
         print(Y+"  │  "+W+"[8]  Train Bug-ML Model                       "+Y+"  │"+W)
@@ -4870,8 +5471,9 @@ def main():
         print(Y+"  │  "+W+"[0]  Exit                                     "+Y+"  │"+W)
         print(Y+"  └──────────────────────────────────────────────────────┘\n"+W)
 
-        ch = input(C+"  Choice (0-9): "+W).strip()
-        if   ch=='1': scan_domain_menu(cfg)
+        ch = input(C+"  Choice (S / 0-9): "+W).strip().lower()
+        if   ch=='s': smart_unified_scan(cfg)
+        elif ch=='1': scan_domain_menu(cfg)
         elif ch=='2': single_host_menu(cfg)
         elif ch=='3': batch_scan_menu(cfg)
         elif ch=='4': zb_standalone_menu(cfg)
@@ -4883,7 +5485,7 @@ def main():
         elif ch=='0':
             print(G+"\n  ජය වේවා! 👋\n"+W); sys.exit(0)
         else:
-            print(R+"\n  [-] 0-9 ඇතුලත් කරන්න.\n"+W); time.sleep(1)
+            print(R+"\n  [-] S හෝ 0-9 ඇතුලත් කරන්න.\n"+W); time.sleep(1)
 
 if __name__=="__main__":
     main()
