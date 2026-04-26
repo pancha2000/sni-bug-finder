@@ -34,6 +34,22 @@ import asyncio, socket, ssl, os, sys, time, json, threading, re, struct
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict, List
 
+# ── Speed Hunter module (sni_speed_hunter.py) ────────────────────
+try:
+    from sni_speed_hunter import (
+        run_speed_hunter_menu, ISP_PROFILES, IP_RANGE_DB,
+        benchmark_all_transports, generate_3xui_config,
+        format_3xui_panel, find_best_host,
+        run_ip_range_hunter, detect_isp_asn as sh_detect_isp,
+    )
+    _SPEED_HUNTER_OK = True
+except ImportError:
+    _SPEED_HUNTER_OK = False
+    def run_speed_hunter_menu(*a, **k):
+        print('\033[91m  [-] sni_speed_hunter.py not found!\033[0m')
+        print('\033[93m  → Same folder එකේ sni_speed_hunter.py තිබිය යුතුයි.\033[0m')
+        input('\n  Enter...')
+
 # ── Optional dependency loader ────────────────────────────────────
 def _try_import(name, pkg=None):
     import importlib
@@ -3954,7 +3970,7 @@ def analyze_3xui(r):
     }
 
 def display_3xui_configs(results):
-    """Top bug hosts වල 3x-ui config screen-friendly format එකෙන් print"""
+    """Top bug hosts වල 3x-ui config — ALL working transports display"""
     bugs = [r for r in results if r["is_bug_host"]]
     if not bugs:
         print(Y+"  [!] Bug hosts නෑ — 3x-ui config generate කරන්න බෑ."+W)
@@ -3963,6 +3979,150 @@ def display_3xui_configs(results):
     print(f"\n{M}{'═'*72}{W}")
     print(M+BOLD+"  ★  3x-ui INBOUND CONFIG GUIDE  ★"+W)
     print(f"{M}{'═'*72}{W}\n")
+
+    for i, r in enumerate(bugs[:8], 1):
+        cfg    = analyze_3xui(r)
+        m      = r["sni_methods"]
+        op     = r["open_ports"]
+
+        # ── Header ───────────────────────────────────────────────────
+        print(G+BOLD+f"  [{i}] {cfg['host']}"+W
+              + DIM+f"  (IP: {cfg['ip']})"+W
+              + (f"  {Y}{cfg['cdn_note']}{W}" if cfg['cdn_note'] else ""))
+        print(C+"  "+f"{'─'*68}"+W)
+
+        # ── Speed Hunter transport score (if available) ───────────────
+        if _SPEED_HUNTER_OK:
+            try:
+                ip   = cfg["ip"]
+                sni  = cfg["sni"]
+                plist = sorted(op.keys()) if op else [443, 80]
+                bench = benchmark_all_transports(ip, sni, plist, timeout=4.0)
+                winner     = bench.get("winner")
+                win_score  = bench.get("winner_score", 0)
+                transports = bench.get("transports", {})
+            except Exception:
+                bench = {}; winner = None; transports = {}
+        else:
+            bench = {}; winner = None; transports = {}
+
+        # ── Transport tags ────────────────────────────────────────────
+        tags = []
+        if m.get("grpc_stream",{}).get("works"):       tags.append(B+"gRPC★"+W)
+        if m.get("xhttp_test",{}).get("works"):        tags.append(C+"SplitHTTP★"+W)
+        if m.get("ws_real_payload",{}).get("works"):   tags.append(G+"WS★"+W)
+        if m.get("ws_best_path",{}).get("works"):      tags.append(G+"WS-Path★"+W)
+        if m.get("domain_fronting",{}).get("works"):   tags.append(Y+"Fronting★"+W)
+        if m.get("vless_probe",{}).get("works"):       tags.append(G+"VLESS★"+W)
+        if m.get("reality_probe",{}).get("looks_reality"): tags.append(M+"Reality★"+W)
+        if r.get("http2"):                             tags.append(B+"H2"+W)
+        if tags:
+            print(f"  {BOLD}Capabilities:{W} " + " │ ".join(tags))
+
+        # Speed Hunter winner
+        if winner:
+            wclr = G+BOLD if win_score >= 60 else Y
+            print(f"  {BOLD}Speed Winner:{W} {wclr}{winner}{W} "
+                  f"{DIM}(score:{win_score}){W}")
+
+        # ── ALL Working Transport Configs ─────────────────────────────
+        # Collect all transports to generate configs for
+        all_transport_cfgs = []
+
+        # From SNI scan results
+        scan_transports = []
+        if m.get("grpc_stream",{}).get("works"):
+            port, _ = _best_port(op, prefer_tls=True)
+            scan_transports.append(("gRPC", port, "/", True))
+        if m.get("xhttp_test",{}).get("works"):
+            port, _ = _best_port(op, prefer_tls=True)
+            scan_transports.append(("SplitHTTP", port, "/xhttp", True))
+        if m.get("ws_real_payload",{}).get("works") or m.get("ws_best_path",{}).get("works"):
+            ws_m    = m.get("ws_best_path",{}) or m.get("ws_real_payload",{})
+            ws_path = ws_m.get("best_path", ws_m.get("path", "/"))
+            port_tls  = _best_port(op, prefer_tls=True)
+            port_plain = _best_port(op, prefer_tls=False)
+            scan_transports.append(("WS+TLS", port_tls[0], ws_path, True))
+            if port_plain[0] != port_tls[0]:
+                scan_transports.append(("WS", port_plain[0], ws_path, False))
+        if not scan_transports:
+            port, use_tls = _best_port(op, prefer_tls=True)
+            scan_transports.append(("TCP+TLS", port, "/", use_tls))
+
+        # From Speed Hunter benchmark
+        sh_transports = []
+        for tk, tv in sorted(transports.items(),
+                             key=lambda x: x[1].get("score",0), reverse=True)[:3]:
+            if tv.get("score", 0) > 20:
+                tr_type, port, path = tk.split(":")[0], tv.get("port", 443), "/"
+                if "/" in tk.split(":",1)[-1]:
+                    path = "/" + tk.split("/",1)[-1]
+                sh_transports.append((tk, port, path, tv.get("score",0)))
+
+        # ── Print each transport config box ──────────────────────────
+        for tr_idx, (tr_name, tr_port, tr_path, tr_tls) in enumerate(scan_transports[:3]):
+            net_map = {
+                "gRPC": "grpc", "WS+TLS": "ws", "WS": "ws",
+                "SplitHTTP": "splithttp", "HTTPUpgrade": "httpupgrade",
+                "TCP+TLS": "tcp",
+            }
+            network  = net_map.get(tr_name.split("+")[0], "ws")
+            use_tls  = tr_tls if isinstance(tr_tls, bool) else (tr_port in [443,8443,2053,2083,2087,2096])
+            security = "tls" if use_tls else "none"
+
+            # Is this the speed winner?
+            is_winner = winner and tr_name.split("+")[0] in winner
+            hdr_clr   = G+BOLD if is_winner else C
+
+            print(hdr_clr+f"\n  ┌─ Transport [{tr_idx+1}]: {tr_name}"
+                  + (" ← Speed Winner ★" if is_winner else "")
+                  + f" {'─'*max(0,42-len(tr_name))}┐{W}")
+            print(C+f"  │{W} Remark       : {G}{cfg['host']}-{tr_name}{W}")
+            print(C+f"  │{W} Protocol     : {G}vless{W}")
+            print(C+f"  │{W} Port         : {G}{tr_port}{W}")
+            print(C+f"  │{W} Network      : {G}{network}{W}")
+
+            if network == "grpc":
+                print(C+f"  │{W} gRPC Mode    : {G}multi{W}")
+                print(C+f"  │{W} Service Name : {G}grpc{W}")
+            elif network in ["ws","splithttp","httpupgrade"]:
+                print(C+f"  │{W} Path         : {G}{tr_path}{W}")
+                print(C+f"  │{W} Host Header  : {G}{cfg['sni']}{W}")
+
+            print(C+f"  │{W} TLS          : {G if use_tls else Y}{security}{W}")
+            if use_tls:
+                print(C+f"  │{W} SNI          : {G}{cfg['sni']}{W}")
+                print(C+f"  │{W} Fingerprint  : {G}chrome{W}")
+                print(C+f"  │{W} allowInsecure: {G}true{W}")
+            print(C+f"  └{'─'*52}┘{W}")
+
+            # Share link
+            params = f"security={security}&sni={cfg['sni']}&fp=chrome&type={network}&allowInsecure=1"
+            if network == "grpc":
+                params += "&serviceName=grpc&mode=multi"
+            elif network in ["ws","splithttp","httpupgrade"]:
+                params += f"&path={tr_path}&host={cfg['sni']}"
+            share = f"vless://[UUID]@{cfg['ip']}:{tr_port}?{params}#{cfg['host']}-{tr_name}"
+            print(Y+f"  Link: {DIM}{share}{W}")
+
+        # Speed Hunter additional links
+        if sh_transports and _SPEED_HUNTER_OK:
+            print(C+f"\n  {DIM}Speed Hunter Alternatives:{W}")
+            for tk, tk_port, tk_path, tk_score in sh_transports[:2]:
+                try:
+                    sh_cfg = generate_3xui_config(
+                        cfg["ip"], cfg["sni"], "Unknown", tk, None, cfg["ip"])
+                    print(Y+f"  [{tk}] score:{tk_score}"+W)
+                    print(DIM+f"  {sh_cfg['share_link']}"+W)
+                except Exception:
+                    pass
+
+        print(f"\n  {BOLD}Bug Score :{W} {sc(cfg['bug_score'])}{cfg['bug_score']}%{W}\n")
+
+    print(M+"  "+f"{'═'*70}"+W)
+    print(Y+BOLD+"  NOTE: [UUID] ← 3x-ui panel එකේ generate කරලා replace කරන්න."+W)
+    print(Y+"  allowInsecure=true — SNI mismatch mode. Assessment only."+W)
+    print(M+"  "+f"{'═'*70}"+W+"\n")
 
     for i, r in enumerate(bugs[:8], 1):
         cfg = analyze_3xui(r)
@@ -4095,12 +4255,12 @@ def banner():
     }
     print(f"""
 {C}╔══════════════════════════════════════════════════════════════════╗
-║  {G}{BOLD}SNI BUG HOST FINDER{C} v7.0  {DIM}★ ZERO-BALANCE EDITION{C}              ║
-║  {DIM}ISP-DB | CaptivePortal | ProxyDetect | DNS-Hijack | MTU | ML{C}  ║
+║  {G}{BOLD}SNI BUG HOST FINDER{C} v8.0  {DIM}★ SPEED HUNTER EDITION{C}              ║
+║  {DIM}IP-Range | Transport-Bench | ISP-Config | ZB-Detect | ML{C}       ║
 ╚══════════════════════════════════════════════════════════════════╝{W}
   {C}curl_cffi:{W}{deps['curl_cffi']}  {C}httpx/H2:{W}{deps['httpx/H2']}  {C}aiohttp:{W}{deps['aiohttp']}  {C}aiodns:{W}{deps['aiodns']}  {C}dnspython:{W}{deps['dnspython']}
-  {C}aioquic:{W}{deps['aioquic']}  {C}scapy:{W}{deps['scapy']}  {C}sklearn/ML:{W}{deps['sklearn']}
-{Y}  [!] Educational & Research use only{W}
+  {C}aioquic:{W}{deps['aioquic']}  {C}scapy:{W}{deps['scapy']}  {C}sklearn/ML:{W}{deps['sklearn']}  {C}SpeedHunter:{W}{G+'✔'+W if _SPEED_HUNTER_OK else R+'✘'+W}
+{Y}  [!] Security Assessment Tool — Research & Educational use only{W}
 """)
 
 def scan_domain_menu(cfg):
@@ -4692,33 +4852,36 @@ def main():
 
     while True:
         banner()
-        print(Y+"  ┌──────────────────────────────────────────────────┐"+W)
-        print(Y+"  │          MAIN MENU  v7.0  ★ ZERO-BALANCE         │"+W)
-        print(Y+"  ├──────────────────────────────────────────────────┤"+W)
-        print(Y+"  │  "+W+"[1]  Domain Scan      (Full SNI + ZB detect)"+Y+"  │"+W)
-        print(Y+"  │  "+W+"[2]  Single Host      (Deep Check + ZB)     "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[3]  Batch Scan       (File Input)          "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[4]  ZB-Only Scan     (Zero-Balance focus)  "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[5]  Settings / Config                      "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[6]  Dependencies Status                    "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[7]  Train Bug-ML Model                     "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[8]  Train ZB-ML Model                      "+Y+"  │"+W)
-        print(Y+"  │  "+W+"[9]  Exit                                   "+Y+"  │"+W)
-        print(Y+"  └──────────────────────────────────────────────────┘\n"+W)
+        sh_status = G+"✔"+W if _SPEED_HUNTER_OK else R+"✘ (sni_speed_hunter.py missing)"+W
+        print(Y+"  ┌──────────────────────────────────────────────────────┐"+W)
+        print(Y+"  │     MAIN MENU  v8.0  ★ SPEED HUNTER EDITION         │"+W)
+        print(Y+"  ├──────────────────────────────────────────────────────┤"+W)
+        print(Y+"  │  "+W+"[1]  Domain Scan       (Full SNI + ZB)        "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[2]  Single Host        (Deep Check + ZB)     "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[3]  Batch Scan         (File Input)          "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[4]  ZB-Only Scan       (Zero-Balance focus)  "+Y+"  │"+W)
+        print(Y+"  │  "+W+f"[5]  ★ Speed Hunter     {sh_status:<28}"+Y+"  │"+W)
+        print(Y+"  │  "+W+"[6]  Settings / Config                        "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[7]  Dependencies Status                      "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[8]  Train Bug-ML Model                       "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[9]  Train ZB-ML Model                        "+Y+"  │"+W)
+        print(Y+"  │  "+W+"[0]  Exit                                     "+Y+"  │"+W)
+        print(Y+"  └──────────────────────────────────────────────────────┘\n"+W)
 
-        ch = input(C+"  Choice (1-9): "+W).strip()
+        ch = input(C+"  Choice (0-9): "+W).strip()
         if   ch=='1': scan_domain_menu(cfg)
         elif ch=='2': single_host_menu(cfg)
         elif ch=='3': batch_scan_menu(cfg)
         elif ch=='4': zb_standalone_menu(cfg)
-        elif ch=='5': config_menu(cfg)
-        elif ch=='6': deps_menu()
-        elif ch=='7': ml_train_menu()
-        elif ch=='8': zb_ml_train_menu()
-        elif ch=='9':
+        elif ch=='5': run_speed_hunter_menu(cfg.get("timeout", 5))
+        elif ch=='6': config_menu(cfg)
+        elif ch=='7': deps_menu()
+        elif ch=='8': ml_train_menu()
+        elif ch=='9': zb_ml_train_menu()
+        elif ch=='0':
             print(G+"\n  ජය වේවා! 👋\n"+W); sys.exit(0)
         else:
-            print(R+"\n  [-] 1-9 ඇතුලත් කරන්න.\n"+W); time.sleep(1)
+            print(R+"\n  [-] 0-9 ඇතුලත් කරන්න.\n"+W); time.sleep(1)
 
 if __name__=="__main__":
     main()
