@@ -5243,7 +5243,7 @@ def smart_unified_scan(cfg):
         print(f"  {G}{c['host']:<38}{W} "
               f"{bclr}{c['bug_score']:>4}%{W} "
               f"{zclr}{c['zb_score']:>4}%{W} "
-              f"{tclr}{c['tr_winner']:<22}{W} "
+              f"{tclr}{str(c.get('tr_winner') or ''):<22}{W} "
               f"{Y}{lat:>6}{W} "
               f"{sclr}{c['composite']:>6}{W} {zb_s}")
 
