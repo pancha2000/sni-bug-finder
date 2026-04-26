@@ -31,7 +31,7 @@
 # ================================================================
 from __future__ import annotations
 import asyncio, socket, ssl, os, sys, time, json, threading, re, struct
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, List
 
 # ── Speed Hunter module (sni_speed_hunter.py) ────────────────────
