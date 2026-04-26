@@ -40,14 +40,16 @@ try:
         run_speed_hunter_menu, ISP_PROFILES, IP_RANGE_DB,
         benchmark_all_transports, generate_3xui_config,
         format_3xui_panel, find_best_host,
-        run_ip_range_hunter, detect_isp_asn as sh_detect_isp,
+        run_ip_range_hunter,
     )
     _SPEED_HUNTER_OK = True
-except ImportError:
+except ImportError as _sh_err:
     _SPEED_HUNTER_OK = False
+    _sh_err_msg = str(_sh_err)
     def run_speed_hunter_menu(*a, **k):
-        print('\033[91m  [-] sni_speed_hunter.py not found!\033[0m')
-        print('\033[93m  → Same folder එකේ sni_speed_hunter.py තිබිය යුතුයි.\033[0m')
+        print('\033[91m  [-] Speed Hunter import failed!\033[0m')
+        print(f'\033[93m  Error: {_sh_err_msg}\033[0m')
+        print('\033[93m  → sni_speed_hunter.py same folder එකේ තිබිය යුතුයි.\033[0m')
         input('\n  Enter...')
 
 # ── Optional dependency loader ────────────────────────────────────
